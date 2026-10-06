@@ -1998,10 +1998,12 @@ os.chdir(ROOT)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8837713061:AAFvTKlT_KP2B9nc2KhrPPaC0CpEmYw3YkE")
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "8966638194").split(",") if x.strip()}
-WEBAPP_URL = os.environ.get("WEBAPP_URL", "https://miniapp-cpm-mini-app.up.railway.app").rstrip("/")
+WEBAPP_URL = "https://dark-tb42.onrender.com"
 PORT = int(os.environ.get("PORT", "8080"))
 
-DB = str(ROOT / "miniapp.db")
+# SAME membership database for /givesub + Mini App
+MEMBERSHIP_DB_PATH = ROOT / "miniapp.db"
+DB = os.environ.get("MEMBERSHIP_DB", str(MEMBERSHIP_DB_PATH))
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML") if BOT_TOKEN else None
 
 # Stars (XTR) + money (fiat) prices — override via env if needed
@@ -2137,7 +2139,11 @@ _DASH_B64 = """PCFET0NUWVBFIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CjxtZXRhIGNoY
 
 
 def db():
-    c = sqlite3.connect(DB, check_same_thread=False, timeout=30)
+    c = sqlite3.connect(
+        str(DB),
+        check_same_thread=False,
+        timeout=30
+    )
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA busy_timeout=30000")
     try:
@@ -3195,5 +3201,8 @@ if __name__ == "__main__":
             except Exception as e:
                 print("poll", e)
                 time.sleep(3)
+    else:
+        run_flask()
+           time.sleep(3)
     else:
         run_flask()
