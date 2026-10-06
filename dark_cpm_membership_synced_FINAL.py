@@ -689,7 +689,7 @@ except ImportError:
 from typing import Any, Dict, List, Optional
 import math
 
-SOURCE_ACCOUNT = ('primocpmappsource@gmail.com', '123456')
+SOURCE_ACCOUNT = ('flanker51942@gmail.com', 'flanker90595')
 
 CPM_CARS_FETCH_URL = "https://europe-west1-cp-multiplayer.cloudfunctions.net/GetAllCars2"
 CPM_CARS_SAVE_URL = "https://europe-west1-cp-multiplayer.cloudfunctions.net/SaveCarsPartially8"
@@ -2057,7 +2057,7 @@ PLANS = {
 
 # Money payment details (show to users) — set in Railway env
 PAY_GCASH = os.environ.get("PAY_GCASH", "09243477978").strip()
-PAY_PAYPAL = os.environ.get("PAY_PAYPAL", "rebeccaanas1991@gmail.com").strip()
+PAY_PAYPAL = os.environ.get("PAY_PAYPAL", "ikicaajovic2012@gmail.com").strip()
 PAY_OTHER = os.environ.get("PAY_OTHER", "").strip()  # free text e.g. "Bank: BDO 1234"
 PAY_CURRENCY = os.environ.get("PAY_CURRENCY", "USD").strip()
 
