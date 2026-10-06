@@ -1683,19 +1683,36 @@ def web_bulk_clone(src_email, src_pass, count, progress_cb=None):
                     pass
             except Exception:
                 pass
-        email, pw = clone_task(rec, cars, i, [], src["login"]["auth"], src["login"].get("firebase_uid"))
-try:
-    apply_profile_to_target(email, pw, rec, include_name=False)
-except Exception:
-    pass
-accounts.append("%s:%s" % (email, pw))
+        email, pw = clone_task(
+            rec,
+            cars,
+            i,
+            [],
+            src["login"]["auth"],
+            src["login"].get("firebase_uid")
+        )
+
+        if not email or not pw:
+            continue
+
+        try:
+            apply_profile_to_target(email, pw, rec, include_name=False)
+        except Exception:
+            pass
+
+        accounts.append("%s:%s" % (email, pw))
+
     if progress_cb:
         try:
             progress_cb(count, count, "Done")
         except Exception:
             pass
-    return {"ok": True, "message": "Created %d full-clone accounts" % len(accounts), "accounts": accounts}
 
+    return {
+        "ok": bool(accounts),
+        "message": "Created %d full-clone accounts" % len(accounts),
+        "accounts": accounts
+    }
 
 def set_cars_siren(cars):
     import copy
