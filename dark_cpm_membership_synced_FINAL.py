@@ -1439,10 +1439,10 @@ def clone_task(src_record, src_cars, i, res_list, source_token, source_uid, prog
         time.sleep(0.5)
 
     if progress_cb: progress_cb(i, "registering")
-if not reg_ok:
-    if progress_cb:
-        progress_cb(i, "failed")
-    return None, None
+    if not reg_ok:
+        if progress_cb:
+            progress_cb(i, "failed")
+        return None, None
 
     blank = {
         "Name": "Player",
