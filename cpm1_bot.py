@@ -2599,13 +2599,21 @@ def root():
 
 @flask_app.route("/login")
 def login_page():
-    return _html("login.html"), 200, {"Content-Type": "text/html; charset=utf-8"}
+    return _html("login.html"), 200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+    }
 
 
 @flask_app.route("/app")
 @flask_app.route("/dashboard")
 def app_page():
-    return _html("dashboard.html"), 200, {"Content-Type": "text/html; charset=utf-8"}
+    return _html("dashboard.html"), 200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+    }
 
 
 @flask_app.route("/api/me", methods=["POST"])
@@ -2616,6 +2624,21 @@ def api_me():
         return jsonify({"ok": False, "error": "Open from Telegram bot → Open App"}), 401
     upsert_user(tg_id, user.get("username") or "", user.get("first_name") or "", user.get("last_name") or "", user.get("photo_url") or "")
     st = sub_status(tg_id)
+
+    # Keep the Mini App display consistent with require_sub(): admins are
+    # allowed to use all features even when no subscription row exists.
+    # Previously require_sub() allowed admins, while /api/me returned
+    # "active": false, which caused the Mini App to show "No active
+    # subscription" and lock the menu visually.
+    if is_admin(tg_id) and not st.get("active"):
+        st = {
+            "active": True,
+            "plan": "lifetime",
+            "plan_label": "Lifetime",
+            "remaining": "Lifetime",
+            "expires_str": "Admin",
+        }
+
     row = get_user(tg_id) or {}
     member_since = "—"
     try:
