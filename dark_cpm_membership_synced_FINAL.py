@@ -2014,7 +2014,7 @@ ROOT = Path(__file__).resolve().parent
 os.chdir(ROOT)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8837713061:AAFvTKlT_KP2B9nc2KhrPPaC0CpEmYw3YkE")
-ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "8966638194").split(",") if x.strip()}
+ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "8966638194 , 8690561995").split(",") if x.strip()}
 WEBAPP_URL = "https://dark-tb42.onrender.com"
 PORT = int(os.environ.get("PORT", "8080"))
 
