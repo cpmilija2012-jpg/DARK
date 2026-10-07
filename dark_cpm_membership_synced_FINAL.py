@@ -2013,7 +2013,7 @@ from flask import Flask, jsonify, redirect, request
 ROOT = Path(__file__).resolve().parent
 os.chdir(ROOT)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8837713061:AAFvTKlT_KP2B9nc2KhrPPaC0CpEmYw3YkE")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8370641267:AAHcFKG7onA5lQ234T_Ynh9pZaBWQzAPIJU")
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "8966638194 , 8690561995").split(",") if x.strip()}
 WEBAPP_URL = "https://dark-tb42.onrender.com"
 PORT = int(os.environ.get("PORT", "8080"))
@@ -2056,19 +2056,16 @@ PLANS = {
 }
 
 # Money payment details (show to users) — set in Railway env
-PAY_GCASH = os.environ.get("PAY_GCASH", "09243477978").strip()
+
 PAY_PAYPAL = os.environ.get("PAY_PAYPAL", "ikicaajovic2012@gmail.com").strip()
-PAY_OTHER = os.environ.get("PAY_OTHER", "").strip()  # free text e.g. "Bank: BDO 1234"
-PAY_CURRENCY = os.environ.get("PAY_CURRENCY", "USD").strip()
 
 def _money_instructions():
     parts = ["<b>Pay with money</b>"]
-    if PAY_GCASH:
-        parts.append("GCash: <code>%s</code>" % PAY_GCASH)
+
     if PAY_PAYPAL:
         parts.append("PayPal: <code>%s</code>" % PAY_PAYPAL)
-    if PAY_OTHER:
-        parts.append(PAY_OTHER)
+    
+    
     if len(parts) == 1:
         parts.append("Contact admin for payment details.")
     parts.append("After payment, admin activates with /givesub.")
@@ -2077,12 +2074,10 @@ def _money_instructions():
 
 def _money_instructions_plain():
     parts = []
-    if PAY_GCASH:
-        parts.append("GCash: " + PAY_GCASH)
+    
     if PAY_PAYPAL:
         parts.append("PayPal: " + PAY_PAYPAL)
-    if PAY_OTHER:
-        parts.append(PAY_OTHER)
+    
     if not parts:
         parts.append("Contact admin for payment details.")
     return " | ".join(parts)
@@ -2471,10 +2466,9 @@ def api_plans():
             "money_label": v.get("money_label", ""),
         })
     pay = {
-        "gcash": PAY_GCASH,
+        
         "paypal": PAY_PAYPAL,
-        "other": PAY_OTHER,
-        "currency": PAY_CURRENCY,
+        
     }
     return jsonify({"ok": True, "plans": plans, "payment": pay})
 
