@@ -1,6 +1,4 @@
-pyTelegramBotAPI
-flask
 requests
 pycryptodome
 brotli
-urllib3
+pyTelegramBotAPI
