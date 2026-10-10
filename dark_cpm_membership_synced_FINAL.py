@@ -1,6 +1,410 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+╔══════════════════════════════════════════════════════╗
+║   ⚡ ILIJA CPM TOOLS - TELEGRAM BOT ⚡               ║
+║   CPM1 + CPM2 · king rank · email/pass · money        ║
+╚══════════════════════════════════════════════════════╝
+"""
+import os, sys, json, base64, struct, time, random, string, threading, warnings
+import requests, urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+warnings.filterwarnings("ignore")
+
+try:
+    import telebot
+except ImportError:
+    print("pip install pyTelegramBotAPI")
+    sys.exit(1)
+
+# lijeno ucitavanje - tek kad se koristi (manji CPU pri bootu)
+_AES = _pad = _unpad = None
+_brotli = None
+def _load_crypto():
+    global _AES, _pad, _unpad
+    if _AES is None:
+        from Crypto.Cipher import AES
+        from Crypto.Util.Padding import pad, unpad
+        _AES, _pad, _unpad = AES, pad, unpad
+def _load_brotli():
+    global _brotli
+    if _brotli is None:
+        import brotli
+        _brotli = brotli
+from telebot import types
+
+# ══════════ CONFIG - STAVI SVOJ TOKEN ══════════
+BOT_TOKEN = os.environ.get("8682873022:AAFxpLAfUFZSX6GMC7ZCmVjZb7d7CBhl0Ts", "").strip()
+OWNER_ID = int(os.environ.get("OWNER_ID", "8884756222") or 8884756222)
+
+bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=4)
+
+# ══════════ CPM2 ENGINE (iz FLANKER/DARKROOT fajlova) ══════════
+C2_API_KEY = 'AIzaSyCQDz9rgjgmvmFkvVfmvr2-7fT4tfrzRRQ'
+C2_CF_BASE = 'https://europe-west1-cpm-2-7cea1.cloudfunctions.net'
+C2_VERSION = '1.3.2.3'
+C2_CLIENT_HASH = 'F05A72840B40DC4FAADF539C5E38062527AE6422'
+C2_OG_BASE = 'https://cpm-2.ogames.kz/api'
+C2_OG_KEY = '320b93f3e7f4410aa52ce24da363ad04'
+C2_BUNDLE = 'com.olzhas.carparking.multyplayer2'
+C2_UA = 'UnityPlayer/2022.3.62f2 (UnityWebRequest/1.0, libcurl/8.10.1-DEV)'
+C2_FB_SIGNUP = f'https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={C2_API_KEY}'
+C2_FB_LOGIN = f'https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={C2_API_KEY}'
+KEY_ADD = '12345678'
+IV_ADD = '01234567'
+http = requests.Session()
+
+class Crypto:
+    def __init__(self, uid):
+        _load_crypto()
+        self.key = (uid[:8] + KEY_ADD).encode()[:16]
+        self.iv = (uid[:8] + IV_ADD).encode()[:16]
+    def encrypt(self, s):
+        return base64.b64encode(_AES.new(self.key, _AES.MODE_CBC, self.iv).encrypt(_pad(s.encode(), 16))).decode()
+    def decrypt(self, s):
+        try: return _unpad(_AES.new(self.key, _AES.MODE_CBC, self.iv).decrypt(base64.b64decode(s)), 16).decode()
+        except: return None
+
+def _xor_key(uid):
+    c = list(uid)
+    if len(c) >= 7: c[4], c[6] = c[6], c[4]
+    if len(c) >= 9: del c[8]
+    if len(c) >= 1: c.append(c[0])
+    return ''.join(c).encode()
+
+def mp_encode(data, uid):
+    _load_brotli()
+    return base64.b64encode(bytes(b ^ _xor_key(uid)[i % len(_xor_key(uid))] for i, b in enumerate(_brotli.compress(data, quality=5)))).decode()
+
+def mp_i32(v): return struct.pack('<i', v)
+def mp_u16(v): return struct.pack('<H', v)
+def mp_i64(v): return struct.pack('<q', v)
+def mp_str(s):
+    if s is None: return b'\xff\xff\xff\xff'
+    if s == "": return mp_i32(0)
+    u = s.encode('utf-8')
+    return mp_i32(~len(u)) + mp_i32(len(s)) + u
+def mp_int_array(a):
+    b = mp_i32(len(a))
+    for v in a: b += mp_i32(v)
+    return b
+def mp_i64_array(a):
+    b = mp_i32(len(a))
+    for v in a: b += mp_i64(v)
+    return b
+def mp_dict_ii(d):
+    b = mp_i32(len(d))
+    for k in sorted(d.keys()): b += mp_i32(k) + mp_i32(d[k])
+    return b
+def mp_dict_is(d):
+    b = mp_i32(len(d))
+    for k in sorted(d.keys()): b += mp_i32(k) + mp_str(d[k])
+    return b
+
+def gen_device(): return ''.join(random.choice('0123456789abcdef') for _ in range(32))
+
+def c2_headers(token):
+    return {"User-Agent": C2_UA, "Content-Type": "application/json; charset=utf-8",
+            "X-Unity-Version": "2022.3.62f2", "Authorization": f"Bearer {token}",
+            "X-Client-Hash": C2_CLIENT_HASH, "X-Client-Platform": "ANDROID",
+            "X-Client-Version": C2_VERSION, "X-Client-DeviceId": gen_device(),
+            "X-Api-Key": C2_OG_KEY, "X-Client-Env": "prod", "X-Bundle-Id": C2_BUNDLE}
+
+def cf(fn, payload, token, timeout=30):
+    body = json.dumps({"data": payload})
+    for attempt in range(3):
+        try:
+            r = http.post(f"{C2_CF_BASE}/{fn}", headers=c2_headers(token), data=body, timeout=timeout, verify=False)
+            if r.status_code == 429 or r.status_code >= 500:
+                time.sleep(2 + attempt * 2); continue
+            return r.json().get("result")
+        except Exception:
+            if attempt < 2: time.sleep(2 + attempt * 2); continue
+            return None
+    return None
+
+def c2_login(email, password):
+    try:
+        r = http.post(C2_FB_LOGIN, json={"email": email, "password": password, "returnSecureToken": True}, timeout=20, verify=False)
+        j = r.json()
+        if "idToken" in j: return {"ok": True, "token": j["idToken"], "uid": j["localId"]}
+        return {"ok": False, "message": j.get("error", {}).get("message", "login failed")}
+    except Exception as e:
+        return {"ok": False, "message": str(e)[:100]}
+
+def c2_start_session(token):
+    oh = {"X-Firebase-Token": token, "X-Client-Platform": "ANDROID", "X-Client-Version": C2_VERSION,
+          "X-Client-DeviceId": gen_device(), "X-Api-Key": C2_OG_KEY, "X-Client-Env": "prod",
+          "X-Bundle-Id": C2_BUNDLE, "Content-Type": "application/json", "User-Agent": C2_UA,
+          "X-Client-Hash": C2_CLIENT_HASH}
+    try: http.get(f"{C2_OG_BASE}/check-service/v1/hash/check", headers=oh, timeout=15, verify=False)
+    except: pass
+    try: http.post(f"{C2_OG_BASE}/check-service/v1/session/start", headers=oh, json={}, timeout=15, verify=False)
+    except: pass
+    time.sleep(0.4)
+    r = cf("MasterMainStartup23_1", "0", token)
+    if isinstance(r, dict): return r.get("code", -1)
+    return -1
+
+KING_RATING = {"cars": 100000, "car_fix": 100000, "car_collided": 100000, "car_exchange": 100000,
+    "car_trade": 100000, "car_wash": 100000, "slicer_cut": 100000, "drift_max": 100000,
+    "drift": 100000, "cargo": 100000, "delivery": 100000, "taxi": 100000, "levels": 100000,
+    "gifts": 100000, "fuel": 100000, "offroad": 100000, "speed_banner": 100000,
+    "reactions": 100000, "police": 100000, "run": 100000, "real_estate": 100000,
+    "t_distance": 100000, "treasure": 100000, "block_post": 100000, "push_ups": 100000,
+    "burnt_tire": 100000, "passanger_distance": 100000, "time": 9999999999, "race_win": 5000}
+
+def c2_king_rank(email, pw):
+    a = c2_login(email, pw)
+    if not a.get("ok"): return {"ok": False, "message": "Login failed: " + a.get("message", "?")}
+    token, uid = a["token"], a["uid"]
+    crypto = Crypto(uid)
+    try:
+        code = c2_start_session(token)
+        if code == 297: return {"ok": False, "message": "Account blocked (297)"}
+    except Exception: pass
+    time.sleep(0.4)
+    all_data = {"general": KING_RATING, "achievements": {k: 5 for k in KING_RATING},
+                "race_win": 5000, "level": 120, "score": 999.0, "batches": [5, 15, 25, 45, 60, 120]}
+    r1 = cf("SetUserRating22_1", crypto.encrypt(json.dumps(all_data)), token)
+    ok_cf = isinstance(r1, dict) and r1.get("code") == 1
+    ok_og = False
+    try:
+        hdrs = {"Content-Type": "application/json", "X-Api-Key": C2_OG_KEY, "X-Client-Version": C2_VERSION,
+                "X-Client-Platform": "Android", "X-Firebase-Token": token, "X-Client-DeviceId": gen_device(),
+                "X-Client-Env": "prod", "X-Bundle-Id": C2_BUNDLE, "X-Client-Hash": C2_CLIENT_HASH, "User-Agent": C2_UA}
+        r2 = http.post(f"{C2_OG_BASE}/progress-service/v1/rating/update", headers=hdrs,
+                       data=json.dumps({"data": crypto.encrypt(json.dumps(KING_RATING))}), timeout=20, verify=False)
+        ok_og = r2.status_code == 200 and '"code":1' in r2.text
+    except Exception: pass
+    try: cf("ValidateRank23_1", "0", token)
+    except Exception: pass
+    return {"ok": bool(ok_cf or ok_og), "message": "KING RANK applied!" if (ok_cf or ok_og) else "Rank write failed - try again"}
+
+def c2_charge_wallet(token, uid, email, password):
+    crypto = Crypto(uid)
+    cf("SaveAppVersionOnAccountCreated22_1", crypto.encrypt(json.dumps({"version": C2_VERSION})), token)
+    time.sleep(0.4)
+    cf("GetRewards22_1", crypto.encrypt(""), token)
+    time.sleep(0.4)
+    cf("SavePlayerRecords22_1", crypto.encrypt("{}"), token)
+    time.sleep(0.4)
+    wallet = mp_encode(mp_i32(1) + mp_u16(0) + mp_i32(8) + mp_i64(50_000_000), uid)
+    ok = False
+    for ep in ("SaveWalletData23_1", "SaveWalletData24_1"):
+        r = cf(ep, wallet, token)
+        if isinstance(r, dict) and r.get("code") == 1: ok = True; break
+        time.sleep(0.4)
+    entries = {0: mp_str(""), 1: mp_str("PREMIUM"), 2: mp_int_array(list(range(225))), 3: mp_i32(255),
+               4: mp_i64(127), 5: mp_i64(127), 6: mp_i32(0)}
+    for k in range(19, 30): entries[k] = mp_int_array(list(range(15)))
+    entries[30] = mp_int_array(list(range(50)))
+    for k in range(31, 42): entries[k] = mp_int_array(list(range(15)))
+    entries[42] = mp_int_array(list(range(50)))
+    entries[43] = mp_dict_ii({i: 1 for i in range(78)})
+    entries[44] = mp_i64((1 << 50) - 1)
+    entries[45] = mp_int_array([1,2,3,4,5,6,7,8])
+    entries[46] = mp_i64_array([-1, 16777215])
+    entries[47] = mp_int_array([1]*110)
+    entries[48] = mp_i64(15)
+    entries[49] = mp_int_array([6,-1,0,0,0,999999999,0,1,0,0,0])
+    entries[50] = mp_int_array([1]*13)
+    entries[51] = mp_int_array([0,0,0,0,0])
+    entries[52] = mp_dict_is({i: "0#1#2#3#4#5#6" for i in range(5)})
+    entries[53] = mp_int_array(list(range(10)))
+    full = mp_i32(len(entries))
+    for k in sorted(entries.keys()):
+        v = entries[k]
+        full += mp_u16(k) + mp_i32(len(v)) + v
+    for ep in ("SavePlayerRecords23_1", "SavePlayerRecords24_1"):
+        r = cf(ep, mp_encode(full, uid), token)
+        if isinstance(r, dict) and r.get("code") == 1: break
+        time.sleep(0.4)
+    return ok
+
+def c2_money(email, pw):
+    a = c2_login(email, pw)
+    if not a.get("ok"): return {"ok": False, "message": "Login failed: " + a.get("message", "?")}
+    try: c2_start_session(a["token"])
+    except Exception: pass
+    ok = c2_charge_wallet(a["token"], a["uid"], email, pw)
+    return {"ok": ok, "message": "50M money + full unlock applied!" if ok else "Wallet write rejected - game may have patched this"}
+
+def c2_change_email(email, pw, new_email):
+    a = c2_login(email, pw)
+    if not a.get("ok"): return {"ok": False, "message": "Login failed: " + a.get("message", "?")}
+    try:
+        r = http.post(f"https://identitytoolkit.googleapis.com/v1/accounts:update?key={C2_API_KEY}",
+                      json={"idToken": a["token"], "email": new_email, "returnSecureToken": True}, timeout=20, verify=False)
+        j = r.json()
+        if j.get("email"): return {"ok": True, "message": f"Email changed to {new_email}"}
+        return {"ok": False, "message": str(j.get("error", {}).get("message", "failed"))[:90]}
+    except Exception as e:
+        return {"ok": False, "message": str(e)[:90]}
+
+def c2_change_password(email, pw, new_pw):
+    a = c2_login(email, pw)
+    if not a.get("ok"): return {"ok": False, "message": "Login failed: " + a.get("message", "?")}
+    if len(new_pw) < 6: return {"ok": False, "message": "Password min 6 chars"}
+    try:
+        r = http.post(f"https://identitytoolkit.googleapis.com/v1/accounts:update?key={C2_API_KEY}",
+                      json={"idToken": a["token"], "password": new_pw, "returnSecureToken": True}, timeout=20, verify=False)
+        j = r.json()
+        if j.get("idToken"): return {"ok": True, "message": "Password changed successfully"}
+        return {"ok": False, "message": str(j.get("error", {}).get("message", "failed"))[:90]}
+    except Exception as e:
+        return {"ok": False, "message": str(e)[:90]}
+
+# ══════════ CPM1 ENGINE ══════════
+C1_API_KEY = 'AIzaSyBW1ZbMiUeDZHYUO2bY8Bfnf5rRgrQGPTM'
+C1_RANK_URL = "https://us-central1-cp-multiplayer.cloudfunctions.net/SetUserRating4"
+
+def c1_login(email, password):
+    try:
+        r = http.post(f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={C1_API_KEY}",
+                      json={"email": email, "password": password, "returnSecureToken": True}, timeout=20)
+        j = r.json()
+        if "idToken" in j: return {"ok": True, "token": j["idToken"]}
+        return {"ok": False, "message": j.get("error", {}).get("message", "login failed")}
+    except Exception as e:
+        return {"ok": False, "message": str(e)[:100]}
+
+def c1_king_rank(email, pw):
+    a = c1_login(email, pw)
+    if not a.get("ok"): return {"ok": False, "message": "Login failed: " + a.get("message", "?")}
+    rating = {"RatingData": {"time": 1e22, "cars": 1e16, "car_fix": 1e13, "car_collided": 1e12,
+        "car_exchange": 1e13, "car_trade": 1e13, "car_wash": 1e13, "slicer_cut": 1e13,
+        "drift_max": 1e14, "drift": 1e14, "cargo": 1e5, "delivery": 1e5, "race_win": 3e20,
+        "taxi": 1e10, "levels": 10000990000, "gifts": 1e9, "fuel": 1e10, "offroad": 1e10,
+        "speed_banner": 1e9, "reactions": 1e17, "run": 1e9, "real_estate": 1e9,
+        "t_distance": 1e10, "treasure": 1e10, "block_post": 1e10, "push_ups": 1e12,
+        "burnt_tire": 1e10, "passanger_distance": 1e8}}
+    try:
+        http.post(C1_RANK_URL, json={"data": json.dumps(rating)},
+                  headers={"Content-Type": "application/json", "Authorization": f"Bearer {a['token']}"}, timeout=20)
+    except Exception: pass
+    return {"ok": True, "message": "KING RANK applied!"}
+
+def c1_change_email(email, pw, new_email):
+    a = c1_login(email, pw)
+    if not a.get("ok"): return {"ok": False, "message": "Login failed: " + a.get("message", "?")}
+    try:
+        r = http.post(f"https://identitytoolkit.googleapis.com/v1/accounts:update?key={C1_API_KEY}",
+                      json={"idToken": a["token"], "email": new_email, "returnSecureToken": True}, timeout=20)
+        j = r.json()
+        if j.get("email"): return {"ok": True, "message": f"Email changed to {new_email}"}
+        return {"ok": False, "message": str(j.get("error", {}).get("message", "failed"))[:90]}
+    except Exception as e:
+        return {"ok": False, "message": str(e)[:90]}
+
+def c1_change_password(email, pw, new_pw):
+    a = c1_login(email, pw)
+    if not a.get("ok"): return {"ok": False, "message": "Login failed: " + a.get("message", "?")}
+    if len(new_pw) < 6: return {"ok": False, "message": "Password min 6 chars"}
+    try:
+        r = http.post(f"https://identitytoolkit.googleapis.com/v1/accounts:update?key={C1_API_KEY}",
+                      json={"idToken": a["token"], "password": new_pw, "returnSecureToken": True}, timeout=20)
+        j = r.json()
+        if j.get("idToken"): return {"ok": True, "message": "Password changed successfully"}
+        return {"ok": False, "message": str(j.get("error", {}).get("message", "failed"))[:90]}
+    except Exception as e:
+        return {"ok": False, "message": str(e)[:90]}
+
+def c2_full_unlock_pack(email, pw):
+    a = c2_login(email, pw)
+    if not a.get("ok"): return {"ok": False, "message": "Login failed: " + a.get("message", "?")}
+    try: c2_start_session(a["token"])
+    except Exception: pass
+    ok = _write_full_unlock(a["token"], a["uid"])
+    return {"ok": ok, "message": "FULL UNLOCK applied (wheels, male, female, brakes, calipers, paints, flags, apartments, animation, kits, slots)!" if ok else "Unlock write rejected"}
+
+def _write_full_unlock(token, uid, name=None):
+    entries = {0: mp_str(name or ""), 1: mp_str("PREMIUM"), 2: mp_int_array(list(range(225))), 3: mp_i32(255),
+               4: mp_i64(127), 5: mp_i64(127), 6: mp_i32(0)}
+    for k in range(19, 30): entries[k] = mp_int_array(list(range(15)))
+    entries[30] = mp_int_array(list(range(50)))
+    for k in range(31, 42): entries[k] = mp_int_array(list(range(15)))
+    entries[42] = mp_int_array(list(range(50)))
+    entries[43] = mp_dict_ii({i: 1 for i in range(78)})
+    entries[44] = mp_i64((1 << 50) - 1)
+    entries[45] = mp_int_array([1,2,3,4,5,6,7,8])
+    entries[46] = mp_i64_array([-1, 16777215])
+    entries[47] = mp_int_array([1]*110)
+    entries[48] = mp_i64(15)
+    entries[49] = mp_int_array([6,-1,0,0,0,999999999,0,1,0,0,0])
+    entries[50] = mp_int_array([1]*13)
+    entries[51] = mp_int_array([0,0,0,0,0])
+    entries[52] = mp_dict_is({i: "0#1#2#3#4#5#6" for i in range(5)})
+    entries[53] = mp_int_array(list(range(10)))
+    full = mp_i32(len(entries))
+    for k in sorted(entries.keys()):
+        v = entries[k]
+        full += mp_u16(k) + mp_i32(len(v)) + v
+    ok = False
+    for ep in ("SavePlayerRecords23_1", "SavePlayerRecords24_1", "SavePlayerRecords22_1"):
+        r = cf(ep, mp_encode(full, uid), token)
+        if isinstance(r, dict) and r.get("code") == 1: ok = True; break
+        time.sleep(0.4)
+    return ok
+
+def c2_set_money_amount(email, pw, amount):
+    a = c2_login(email, pw)
+    if not a.get("ok"): return {"ok": False, "message": "Login failed: " + a.get("message", "?")}
+    try: c2_start_session(a["token"])
+    except Exception: pass
+    crypto = Crypto(a["uid"])
+    cf("SaveAppVersionOnAccountCreated22_1", crypto.encrypt(json.dumps({"version": C2_VERSION})), a["token"])
+    time.sleep(0.3)
+    cf("SavePlayerRecords22_1", crypto.encrypt("{}"), a["token"])
+    time.sleep(0.3)
+    try: amount = int(amount)
+    except Exception: return {"ok": False, "message": "Invalid amount"}
+    if amount < 0 or amount > 999_999_999: return {"ok": False, "message": "Amount 0 - 999,999,999"}
+    wallet = mp_encode(mp_i32(1) + mp_u16(0) + mp_i32(8) + mp_i64(amount), a["uid"])
+    ok = False
+    for ep in ("SaveWalletData23_1", "SaveWalletData24_1"):
+        r = cf(ep, wallet, a["token"])
+        if isinstance(r, dict) and r.get("code") == 1: ok = True; break
+        time.sleep(0.4)
+    return {"ok": ok, "message": f"Money set to {amount:,}!" if ok else "Wallet write rejected"}
+
+def c2_change_name(email, pw, new_name):
+    a = c2_login(email, pw)
+    if not a.get("ok"): return {"ok": False, "message": "Login failed: " + a.get("message", "?")}
+    try: c2_start_session(a["token"])
+    except Exception: pass
+    ok = _write_full_unlock(a["token"], a["uid"], name=str(new_name)[:24])
+    return {"ok": ok, "message": f"Name set to '{new_name}' (with full unlock refresh)" if ok else "Name write rejected"}
+
+def c2_max_race(email, pw):
+    a = c2_login(email, pw)
+    if not a.get("ok"): return {"ok": False, "message": "Login failed: " + a.get("message", "?")}
+    try: c2_start_session(a["token"])
+    except Exception: pass
+    crypto = Crypto(a["uid"])
+    rating = dict(KING_RATING)
+    r1 = cf("SetUserRating22_1", crypto.encrypt(json.dumps({"general": rating, "race_win": 5000, "level": 120, "score": 999.0})), a["token"])
+    ok = isinstance(r1, dict) and r1.get("code") == 1
+    return {"ok": ok, "message": "MAX RACE WINS applied!" if ok else "Write failed"}
+
+def c2_daily_reward(email, pw):
+    a = c2_login(email, pw)
+    if not a.get("ok"): return {"ok": False, "message": "Login failed: " + a.get("message", "?")}
+    try: c2_start_session(a["token"])
+    except Exception: pass
+    crypto = Crypto(a["uid"])
+    ok = False
+    for ep in ("GetRewards23_1", "GetRewards22_1"):
+        r = cf(ep, crypto.encrypt(""), a["token"])
+        if isinstance(r, dict) and r.get("code") == 1: ok = True; break
+        time.sleep(0.3)
+    return {"ok": ok, "message": "Daily reward claimed!" if ok else "No reward available (already claimed or endpoint moved)"}
+
+
+
+# ===== CPM1 engine imported from DARK (Mini App / Flask / membership excluded) =====
+#!/usr/bin/env python3
 """DARK CPM - Mini App (ALL-IN-ONE: bot + cpm1_core + cpm1_clone + siren + plates)."""
-from __future__ import annotations
 
 
 import os, time, json, hashlib, zlib, sqlite3, secrets, html, threading, struct, base64, struct, base64
@@ -689,7 +1093,7 @@ except ImportError:
 from typing import Any, Dict, List, Optional
 import math
 
-SOURCE_ACCOUNT = ('PremiumClone443498@gmail.com', '123456')
+SOURCE_ACCOUNT = (os.environ.get("CPM1_SOURCE_EMAIL", "").strip(), os.environ.get("CPM1_SOURCE_PASSWORD", ""))
 
 CPM_CARS_FETCH_URL = "https://europe-west1-cp-multiplayer.cloudfunctions.net/GetAllCars2"
 CPM_CARS_SAVE_URL = "https://europe-west1-cp-multiplayer.cloudfunctions.net/SaveCarsPartially8"
@@ -1977,1275 +2381,234 @@ def inject_plates(email: str, password: str, merge: bool = True, plates_path: Pa
         final = {"allPlates": list(by_id.values())}
     else:
         final = {"allPlates": incoming}
-    res = nuker._modify(uid, {"platesData": final}, force_fields={"platesData"})
-    if res.get("ok"):
-        res["message"] = "OK — %d plate(s) injected" % len(incoming)
-        res["injected"] = len(incoming)
-        res["total_on_account"] = len(final["allPlates"])
-    return res
-
-
-# ================================================================
-#  BOT + WEB APP (merged)
-# ================================================================
-
-#!/usr/bin/env python3
-"""DARK CPM — Mini App product (bot = launcher only)."""
-
-import base64
-import hashlib
-import hmac
-import io
-import json
-import os
-import secrets
-import sqlite3
-import threading
-import time
-from datetime import datetime
-from pathlib import Path
-from urllib.parse import parse_qsl
-
-import telebot
-from telebot import types
-from flask import Flask, jsonify, redirect, request
-
-ROOT = Path(__file__).resolve().parent
-os.chdir(ROOT)
-
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8370641267:AAHcFKG7onA5lQ234T_Ynh9pZaBWQzAPIJU")
-ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "8966638194 , 8690561995").split(",") if x.strip()}
-WEBAPP_URL = "https://dark-tb42.onrender.com"
-PORT = int(os.environ.get("PORT", "8080"))
-
-# SAME membership database for /givesub + Mini App
-MEMBERSHIP_DB_PATH = ROOT / "miniapp.db"
-DB = os.environ.get("MEMBERSHIP_DB", str(MEMBERSHIP_DB_PATH))
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML") if BOT_TOKEN else None
-
-# Stars (XTR) + money (fiat) prices — override via env if needed
-PLANS = {
-    "1day": {
-        "label": "1 Day",
-        "days": 1,
-        "stars": int(os.environ.get("PRICE_1DAY_STARS", "50")),
-        "money": float(os.environ.get("PRICE_1DAY_MONEY", "1.00")),
-        "money_label": os.environ.get("PRICE_1DAY_MONEY_LABEL", "$1"),
-    },
-    "7days": {
-        "label": "7 Days",
-        "days": 7,
-        "stars": int(os.environ.get("PRICE_7DAYS_STARS", "100")),
-        "money": float(os.environ.get("PRICE_7DAYS_MONEY", "3.00")),
-        "money_label": os.environ.get("PRICE_7DAYS_MONEY_LABEL", "$3"),
-    },
-    "1month": {
-        "label": "1 Month",
-        "days": 30,
-        "stars": int(os.environ.get("PRICE_1MONTH_STARS", "250")),
-        "money": float(os.environ.get("PRICE_1MONTH_MONEY", "8.00")),
-        "money_label": os.environ.get("PRICE_1MONTH_MONEY_LABEL", "$8"),
-    },
-    "lifetime": {
-        "label": "Lifetime",
-        "days": 36500,
-        "stars": int(os.environ.get("PRICE_LIFETIME_STARS", "350")),
-        "money": float(os.environ.get("PRICE_LIFETIME_MONEY", "15.00")),
-        "money_label": os.environ.get("PRICE_LIFETIME_MONEY_LABEL", "$15"),
-    },
-}
-
-# Money payment details (show to users) — set in Railway env
-
-PAY_PAYPAL = os.environ.get("PAY_PAYPAL", "ikicaajovic2012@gmail.com").strip()
-
-def _money_instructions():
-    parts = ["<b>Pay with money</b>"]
-
-    if PAY_PAYPAL:
-        parts.append("PayPal: <code>%s</code>" % PAY_PAYPAL)
-    
-    
-    if len(parts) == 1:
-        parts.append("Contact admin for payment details.")
-    parts.append("After payment, admin activates with /givesub.")
-    return "\n".join(parts)
-
-
-def _money_instructions_plain():
-    parts = []
-    
-    if PAY_PAYPAL:
-        parts.append("PayPal: " + PAY_PAYPAL)
-    
-    if not parts:
-        parts.append("Contact admin for payment details.")
-    return " | ".join(parts)
-
-
-
-
-_LOGIN_B64 = """PCFET0NUWVBFIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CjxtZXRhIGNoYXJzZXQ9InV0Zi04Ii8+CjxtZXRhIG5hbWU9InZpZXdwb3J0IiBjb250
-ZW50PSJ3aWR0aD1kZXZpY2Utd2lkdGgsIGluaXRpYWwtc2NhbGU9MSwgbWF4aW11bS1zY2FsZT0xLCB1c2VyLXNjYWxhYmxlPW5vIi8+Cjx0aXRsZT5EQVJL
-IENQTSDigJQgTG9naW48L3RpdGxlPgo8c2NyaXB0IHNyYz0iaHR0cHM6Ly90ZWxlZ3JhbS5vcmcvanMvdGVsZWdyYW0td2ViLWFwcC5qcyI+PC9zY3JpcHQ+
-CjxzdHlsZT4KOnJvb3QgewogIC0tYmc6ICMwYjBiMGY7IC0tY2FyZDogIzE0MTQxYTsgLS1saW5lOiByZ2JhKDI1NSwyNTUsMjU1LC4wOCk7CiAgLS10ZXh0
-OiAjZjRmNGY1OyAtLW11dGVkOiAjOWNhM2FmOyAtLWFjY2VudDogI2E4NTVmNzsgLS1hY2NlbnQyOiAjYzAyNmQzOwp9CiogeyBib3gtc2l6aW5nOiBib3Jk
-ZXItYm94OyBtYXJnaW46IDA7IHBhZGRpbmc6IDA7IH0KYm9keSB7CiAgZm9udC1mYW1pbHk6IC1hcHBsZS1zeXN0ZW0sIEJsaW5rTWFjU3lzdGVtRm9udCwg
-IlNGIFBybyBUZXh0IiwgIlNlZ29lIFVJIiwgc3lzdGVtLXVpLCBzYW5zLXNlcmlmOwogIGJhY2tncm91bmQ6IHJhZGlhbC1ncmFkaWVudChlbGxpcHNlIGF0
-IHRvcCwgIzFhMGEyZSAwJSwgIzBiMGIwZiA2MCUpOwogIGNvbG9yOiB2YXIoLS10ZXh0KTsgbWluLWhlaWdodDogMTAwdmg7IHBhZGRpbmc6IDIwcHggMTZw
-eDsKfQoud3JhcCB7IG1heC13aWR0aDogNDIwcHg7IG1hcmdpbjogMCBhdXRvOyBtaW4taGVpZ2h0OiA5MHZoOyBkaXNwbGF5OiBmbGV4OyBmbGV4LWRpcmVj
-dGlvbjogY29sdW1uOyBqdXN0aWZ5LWNvbnRlbnQ6IGNlbnRlcjsgfQouYnJhbmQgeyB0ZXh0LWFsaWduOiBjZW50ZXI7IGZvbnQtd2VpZ2h0OiA4MDA7IGZv
-bnQtc2l6ZTogMS4zNXJlbTsgbGV0dGVyLXNwYWNpbmc6IC4wMmVtOwogIGJhY2tncm91bmQ6IGxpbmVhci1ncmFkaWVudCg5MGRlZywgI2E4NTVmNywgI2Vj
-NDg5OSk7IC13ZWJraXQtYmFja2dyb3VuZC1jbGlwOiB0ZXh0OyBjb2xvcjogdHJhbnNwYXJlbnQ7IG1hcmdpbi1ib3R0b206IDZweDsgfQouc3ViIHsgdGV4
-dC1hbGlnbjogY2VudGVyOyBjb2xvcjogdmFyKC0tbXV0ZWQpOyBmb250LXNpemU6IC44NXJlbTsgbWFyZ2luLWJvdHRvbTogMjJweDsgfQouY2FyZCB7CiAg
-YmFja2dyb3VuZDogdmFyKC0tY2FyZCk7IGJvcmRlcjogMXB4IHNvbGlkIHZhcigtLWxpbmUpOyBib3JkZXItcmFkaXVzOiAxOHB4OyBwYWRkaW5nOiAyMHB4
-IDE4cHg7CiAgYm94LXNoYWRvdzogMCAxMnB4IDQwcHggcmdiYSgwLDAsMCwuNDUpOwp9Ci50YWJzIHsgZGlzcGxheTogZmxleDsgYmFja2dyb3VuZDogIzBm
-MGYxNDsgYm9yZGVyLXJhZGl1czogOTk5cHg7IHBhZGRpbmc6IDRweDsgbWFyZ2luLWJvdHRvbTogMTZweDsgfQoudGFiIHsgZmxleDogMTsgYm9yZGVyOiAw
-OyBiYWNrZ3JvdW5kOiB0cmFuc3BhcmVudDsgY29sb3I6IHZhcigtLW11dGVkKTsgZm9udC13ZWlnaHQ6IDYwMDsgcGFkZGluZzogMTBweDsgYm9yZGVyLXJh
-ZGl1czogOTk5cHg7IGN1cnNvcjogcG9pbnRlcjsgZm9udC1zaXplOiAuOXJlbTsgfQoudGFiLm9uIHsgYmFja2dyb3VuZDogbGluZWFyLWdyYWRpZW50KDEz
-NWRlZywgIzdjM2FlZCwgI2MwMjZkMyk7IGNvbG9yOiAjZmZmOyB9Ci5maWVsZCB7IG1hcmdpbi1ib3R0b206IDEycHg7IHBvc2l0aW9uOiByZWxhdGl2ZTsg
-fQppbnB1dCB7CiAgd2lkdGg6IDEwMCU7IGJhY2tncm91bmQ6ICMwZjBmMTQ7IGJvcmRlcjogMXB4IHNvbGlkIHZhcigtLWxpbmUpOyBib3JkZXItcmFkaXVz
-OiAxMnB4OwogIHBhZGRpbmc6IDE0cHggMTZweDsgY29sb3I6IHZhcigtLXRleHQpOyBmb250LXNpemU6IC45NXJlbTsgb3V0bGluZTogbm9uZTsKfQppbnB1
-dDpmb2N1cyB7IGJvcmRlci1jb2xvcjogcmdiYSgxNjgsODUsMjQ3LC41NSk7IH0KaW5wdXQ6OnBsYWNlaG9sZGVyIHsgY29sb3I6ICM2YjcyODA7IH0KLmV5
-ZSB7IHBvc2l0aW9uOiBhYnNvbHV0ZTsgcmlnaHQ6IDEycHg7IHRvcDogNTAlOyB0cmFuc2Zvcm06IHRyYW5zbGF0ZVkoLTUwJSk7IGJhY2tncm91bmQ6IG5v
-bmU7IGJvcmRlcjogMDsgY29sb3I6IHZhcigtLW11dGVkKTsgY3Vyc29yOiBwb2ludGVyOyBmb250LXNpemU6IC45cmVtOyB9Ci5idG4gewogIHdpZHRoOiAx
-MDAlOyBib3JkZXI6IDA7IGJvcmRlci1yYWRpdXM6IDEycHg7IHBhZGRpbmc6IDE0cHg7IG1hcmdpbi10b3A6IDZweDsKICBmb250LXdlaWdodDogNzAwOyBm
-b250LXNpemU6IC45NXJlbTsgY3Vyc29yOiBwb2ludGVyOwogIGJhY2tncm91bmQ6IGxpbmVhci1ncmFkaWVudCgxMzVkZWcsICM3YzNhZWQsICNjMDI2ZDMs
-ICNlYzQ4OTkpOyBjb2xvcjogI2ZmZjsKICBib3gtc2hhZG93OiAwIDhweCAyNHB4IHJnYmEoMTkyLDM4LDIxMSwuMyk7Cn0KLmVyciB7IGNvbG9yOiAjZjg3
-MTcxOyBmb250LXNpemU6IC44MnJlbTsgdGV4dC1hbGlnbjogY2VudGVyOyBtYXJnaW4tdG9wOiAxMnB4OyBtaW4taGVpZ2h0OiAxLjJlbTsgfQouaGludCB7
-IGNvbG9yOiB2YXIoLS1tdXRlZCk7IGZvbnQtc2l6ZTogLjc1cmVtOyB0ZXh0LWFsaWduOiBjZW50ZXI7IG1hcmdpbi10b3A6IDE0cHg7IH0KPC9zdHlsZT4K
-PC9oZWFkPgo8Ym9keT4KPGRpdiBjbGFzcz0id3JhcCI+CiAgPGRpdiBjbGFzcz0iYnJhbmQiPkRBUksgQ1BNPC9kaXY+CiAgPGRpdiBjbGFzcz0ic3ViIj5T
-aWduIGluIHdpdGggeW91ciBDUE0xIGFjY291bnQ8L2Rpdj4KICA8ZGl2IGNsYXNzPSJjYXJkIj4KICAgIDxkaXYgY2xhc3M9InRhYnMiPgogICAgICA8YnV0
-dG9uIHR5cGU9ImJ1dHRvbiIgY2xhc3M9InRhYiBvbiIgaWQ9InRhYkwiPkxvZ2luPC9idXR0b24+CiAgICAgIDxidXR0b24gdHlwZT0iYnV0dG9uIiBjbGFz
-cz0idGFiIiBpZD0idGFiUiI+UmVnaXN0ZXI8L2J1dHRvbj4KICAgIDwvZGl2PgogICAgPGZvcm0gaWQ9ImZvcm0iPgogICAgICA8ZGl2IGNsYXNzPSJmaWVs
-ZCI+PGlucHV0IHR5cGU9ImVtYWlsIiBpZD0iZW1haWwiIHBsYWNlaG9sZGVyPSJFbWFpbCIgcmVxdWlyZWQgYXV0b2NvbXBsZXRlPSJ1c2VybmFtZSIvPjwv
-ZGl2PgogICAgICA8ZGl2IGNsYXNzPSJmaWVsZCI+CiAgICAgICAgPGlucHV0IHR5cGU9InBhc3N3b3JkIiBpZD0icGFzcyIgcGxhY2Vob2xkZXI9IlBhc3N3
-b3JkIiByZXF1aXJlZCBhdXRvY29tcGxldGU9ImN1cnJlbnQtcGFzc3dvcmQiLz4KICAgICAgICA8YnV0dG9uIHR5cGU9ImJ1dHRvbiIgY2xhc3M9ImV5ZSIg
-aWQ9ImV5ZSI+U2hvdzwvYnV0dG9uPgogICAgICA8L2Rpdj4KICAgICAgPGJ1dHRvbiB0eXBlPSJzdWJtaXQiIGNsYXNzPSJidG4iIGlkPSJnbyI+TG9naW48
-L2J1dHRvbj4KICAgICAgPGRpdiBjbGFzcz0iZXJyIiBpZD0iZXJyIj48L2Rpdj4KICAgIDwvZm9ybT4KICA8L2Rpdj4KICA8cCBjbGFzcz0iaGludCI+T3Bl
-biB0aGlzIE1pbmkgQXBwIGZyb20gdGhlIFRlbGVncmFtIGJvdCDCtyBPcGVuIEFwcDwvcD4KPC9kaXY+CjxzY3JpcHQ+CmNvbnN0IHRnID0gd2luZG93LlRl
-bGVncmFtICYmIHdpbmRvdy5UZWxlZ3JhbS5XZWJBcHA7CmlmICh0ZykgeyB0cnkgeyB0Zy5yZWFkeSgpOyB0Zy5leHBhbmQoKTsgdGcuc2V0SGVhZGVyQ29s
-b3IoJyMwYjBiMGYnKTsgdGcuc2V0QmFja2dyb3VuZENvbG9yKCcjMGIwYjBmJyk7IH0gY2F0Y2goZSl7fSB9CmxldCBtb2RlID0gJ2xvZ2luJzsKZG9jdW1l
-bnQuZ2V0RWxlbWVudEJ5SWQoJ3RhYkwnKS5vbmNsaWNrID0gKCkgPT4geyBtb2RlPSdsb2dpbic7IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCd0YWJMJyku
-Y2xhc3NMaXN0LmFkZCgnb24nKTsgZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3RhYlInKS5jbGFzc0xpc3QucmVtb3ZlKCdvbicpOyBkb2N1bWVudC5nZXRF
-bGVtZW50QnlJZCgnZ28nKS50ZXh0Q29udGVudD0nTG9naW4nOyB9Owpkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgndGFiUicpLm9uY2xpY2sgPSAoKSA9PiB7
-IG1vZGU9J3JlZ2lzdGVyJzsgZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3RhYlInKS5jbGFzc0xpc3QuYWRkKCdvbicpOyBkb2N1bWVudC5nZXRFbGVtZW50
-QnlJZCgndGFiTCcpLmNsYXNzTGlzdC5yZW1vdmUoJ29uJyk7IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdnbycpLnRleHRDb250ZW50PSdSZWdpc3Rlcic7
-IH07CmRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdleWUnKS5vbmNsaWNrID0gKCkgPT4geyBjb25zdCBpPWRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdwYXNz
-Jyk7IGkudHlwZSA9IGkudHlwZT09PSdwYXNzd29yZCc/J3RleHQnOidwYXNzd29yZCc7IH07CmZ1bmN0aW9uIHRnVXNlcigpIHsKICBjb25zdCBpbml0RGF0
-YSA9ICh0ZyAmJiB0Zy5pbml0RGF0YSkgfHwgJyc7CiAgbGV0IHRnX2lkPW51bGwsIHVzZXJuYW1lPScnLCBmaXJzdF9uYW1lPScnLCBsYXN0X25hbWU9Jyc7
-CiAgaWYgKHRnICYmIHRnLmluaXREYXRhVW5zYWZlICYmIHRnLmluaXREYXRhVW5zYWZlLnVzZXIpIHsKICAgIGNvbnN0IHUgPSB0Zy5pbml0RGF0YVVuc2Fm
-ZS51c2VyOwogICAgdGdfaWQgPSB1LmlkOyB1c2VybmFtZSA9IHUudXNlcm5hbWV8fCcnOyBmaXJzdF9uYW1lID0gdS5maXJzdF9uYW1lfHwnJzsgbGFzdF9u
-YW1lID0gdS5sYXN0X25hbWV8fCcnOwogIH0KICByZXR1cm4geyBpbml0RGF0YSwgdGdfaWQsIHVzZXJuYW1lLCBmaXJzdF9uYW1lLCBsYXN0X25hbWUgfTsK
-fQpkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnZm9ybScpLm9uc3VibWl0ID0gYXN5bmMgKGUpID0+IHsKICBlLnByZXZlbnREZWZhdWx0KCk7CiAgY29uc3Qg
-ZXJyID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2VycicpOwogIGNvbnN0IGVtYWlsID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2VtYWlsJykudmFs
-dWUudHJpbSgpOwogIGNvbnN0IHBhc3N3b3JkID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3Bhc3MnKS52YWx1ZTsKICBjb25zdCB1ID0gdGdVc2VyKCk7
-CiAgaWYgKCF1LmluaXREYXRhICYmICF1LnRnX2lkKSB7IGVyci50ZXh0Q29udGVudCA9ICdPcGVuIGZyb20gVGVsZWdyYW0gYm90IOKGkiBPcGVuIEFwcCc7
-IHJldHVybjsgfQogIGVyci50ZXh0Q29udGVudCA9IG1vZGU9PT0nbG9naW4nID8gJ1NpZ25pbmcgaW7igKYnIDogJ0NyZWF0aW5nIGFjY291bnTigKYnOwog
-IHRyeSB7CiAgICBjb25zdCByZXMgPSBhd2FpdCBmZXRjaChtb2RlPT09J2xvZ2luJz8nL2FwaS9jcG1fbG9naW4nOicvYXBpL2NwbV9yZWdpc3RlcicsIHsK
-ICAgICAgbWV0aG9kOidQT1NUJywgaGVhZGVyczp7J0NvbnRlbnQtVHlwZSc6J2FwcGxpY2F0aW9uL2pzb24nfSwKICAgICAgYm9keTogSlNPTi5zdHJpbmdp
-ZnkoeyBlbWFpbCwgcGFzc3dvcmQsIC4uLnUgfSkKICAgIH0pOwogICAgY29uc3QgZGF0YSA9IGF3YWl0IHJlcy5qc29uKCk7CiAgICBpZiAoZGF0YS5vaykg
-bG9jYXRpb24uaHJlZiA9ICcvYXBwJzsKICAgIGVsc2UgZXJyLnRleHRDb250ZW50ID0gZGF0YS5lcnJvciB8fCAnRmFpbGVkJzsKICB9IGNhdGNoIChleCkg
-eyBlcnIudGV4dENvbnRlbnQgPSBTdHJpbmcoZXgpOyB9Cn07Cjwvc2NyaXB0Pgo8L2JvZHk+CjwvaHRtbD4K"""
-_DASH_B64 = """PCFET0NUWVBFIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CjxtZXRhIGNoYXJzZXQ9InV0Zi04Ii8+CjxtZXRhIG5hbWU9InZpZXdwb3J0IiBjb250ZW50PSJ3aWR0aD1kZXZpY2Utd2lkdGgsIGluaXRpYWwtc2NhbGU9MSwgbWF4aW11bS1zY2FsZT0xLCB1c2VyLXNjYWxhYmxlPW5vIi8+Cjx0aXRsZT5EQVJLIENQTTwvdGl0bGU+CjxzY3JpcHQgc3JjPSJodHRwczovL3RlbGVncmFtLm9yZy9qcy90ZWxlZ3JhbS13ZWItYXBwLmpzIj48L3NjcmlwdD4KPHN0eWxlPgo6cm9vdCB7CiAgLS1iZzojMGIwYjBmOyAtLWNhcmQ6IzE0MTQxYTsgLS1saW5lOnJnYmEoMjU1LDI1NSwyNTUsLjA4KTsKICAtLXRleHQ6I2Y0ZjRmNTsgLS1tdXRlZDojOWNhM2FmOyAtLXB1cnBsZTojYTg1NWY3OyAtLXBpbms6I2VjNDg5OTsKfQoqe2JveC1zaXppbmc6Ym9yZGVyLWJveDttYXJnaW46MDtwYWRkaW5nOjB9CmJvZHl7CiAgZm9udC1mYW1pbHk6LWFwcGxlLXN5c3RlbSxCbGlua01hY1N5c3RlbUZvbnQsIlNGIFBybyBUZXh0IiwiU2Vnb2UgVUkiLHN5c3RlbS11aSxzYW5zLXNlcmlmOwogIGJhY2tncm91bmQ6cmFkaWFsLWdyYWRpZW50KGVsbGlwc2UgYXQgdG9wLCMxYTBhMmUgMCUsIzBiMGIwZiA1NSUpOwogIGNvbG9yOnZhcigtLXRleHQpO21pbi1oZWlnaHQ6MTAwdmg7cGFkZGluZzoxMnB4IDE0cHggNDBweDsKfQoud3JhcHttYXgtd2lkdGg6NDIwcHg7bWFyZ2luOjAgYXV0b30KLnRvcHsKICBkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6Y2VudGVyO2p1c3RpZnktY29udGVudDpzcGFjZS1iZXR3ZWVuOwogIGJhY2tncm91bmQ6dmFyKC0tY2FyZCk7Ym9yZGVyOjFweCBzb2xpZCB2YXIoLS1saW5lKTtib3JkZXItcmFkaXVzOjE0cHg7CiAgcGFkZGluZzoxMnB4IDE0cHg7bWFyZ2luLWJvdHRvbToxMnB4Owp9Ci5icmFuZHtmb250LXdlaWdodDo4MDA7YmFja2dyb3VuZDpsaW5lYXItZ3JhZGllbnQoOTBkZWcsI2E4NTVmNywjZWM0ODk5KTstd2Via2l0LWJhY2tncm91bmQtY2xpcDp0ZXh0O2NvbG9yOnRyYW5zcGFyZW50fQoudG9wIGJ1dHRvbntiYWNrZ3JvdW5kOnRyYW5zcGFyZW50O2JvcmRlcjowO2NvbG9yOnZhcigtLW11dGVkKTtjdXJzb3I6cG9pbnRlcjtwYWRkaW5nOjZweH0KLmNhcmR7CiAgYmFja2dyb3VuZDp2YXIoLS1jYXJkKTtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWxpbmUpO2JvcmRlci1yYWRpdXM6MTZweDsKICBwYWRkaW5nOjE0cHg7bWFyZ2luLWJvdHRvbToxMnB4Owp9Ci5wcm9maWxle2Rpc3BsYXk6ZmxleDtnYXA6MTJweDthbGlnbi1pdGVtczpjZW50ZXJ9Ci5hdnsKICB3aWR0aDo1MnB4O2hlaWdodDo1MnB4O2JvcmRlci1yYWRpdXM6NTAlO2JhY2tncm91bmQ6bGluZWFyLWdyYWRpZW50KDEzNWRlZywjN2MzYWVkLCNjMDI2ZDMpOwogIGRpc3BsYXk6ZmxleDthbGlnbi1pdGVtczpjZW50ZXI7anVzdGlmeS1jb250ZW50OmNlbnRlcjtmb250LXdlaWdodDo4MDA7ZmxleC1zaHJpbms6MDsKICBvdmVyZmxvdzpoaWRkZW47Cn0KLmF2IGltZ3t3aWR0aDoxMDAlO2hlaWdodDoxMDAlO29iamVjdC1maXQ6Y292ZXJ9Ci5uYW1le2ZvbnQtd2VpZ2h0OjcwMDtmb250LXNpemU6MS4wNXJlbX0KLm1ldGF7Y29sb3I6dmFyKC0tbXV0ZWQpO2ZvbnQtc2l6ZTouOHJlbTttYXJnaW4tdG9wOjJweH0KLnN0YXRze2Rpc3BsYXk6Z3JpZDtncmlkLXRlbXBsYXRlLWNvbHVtbnM6MWZyIDFmcjtnYXA6OHB4O21hcmdpbi10b3A6MTJweH0KLnN0YXR7YmFja2dyb3VuZDojMGYwZjE0O2JvcmRlci1yYWRpdXM6MTJweDtwYWRkaW5nOjEwcHggMTJweDtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWxpbmUpfQouc3RhdCAubHtjb2xvcjp2YXIoLS1tdXRlZCk7Zm9udC1zaXplOi43cmVtfQouc3RhdCAudntmb250LXdlaWdodDo2MDA7Zm9udC1zaXplOi45cmVtO21hcmdpbi10b3A6MnB4O3dvcmQtYnJlYWs6YnJlYWstYWxsfQouc3VibGluZXtmb250LXNpemU6LjgycmVtO2NvbG9yOnZhcigtLW11dGVkKTttYXJnaW4tdG9wOjRweH0KLnN1YmxpbmUub2t7Y29sb3I6IzRhZGU4MH0uc3VibGluZS5ub3tjb2xvcjojZjg3MTcxfQoubG9ja3sKICBiYWNrZ3JvdW5kOnJnYmEoMTI3LDI5LDI5LC4zNSk7Ym9yZGVyOjFweCBzb2xpZCByZ2JhKDI0OCwxMTMsMTEzLC4zNSk7CiAgY29sb3I6I2ZlY2FjYTtib3JkZXItcmFkaXVzOjEycHg7cGFkZGluZzoxMHB4IDEycHg7Zm9udC1zaXplOi44MnJlbTttYXJnaW4tYm90dG9tOjEycHg7ZGlzcGxheTpub25lOwp9Ci5zZWN7Zm9udC1zaXplOi43cmVtO3RleHQtdHJhbnNmb3JtOnVwcGVyY2FzZTtsZXR0ZXItc3BhY2luZzouMDZlbTtjb2xvcjp2YXIoLS1tdXRlZCk7bWFyZ2luOjE2cHggMCA4cHh9Ci5yb3d7CiAgZGlzcGxheTpmbGV4O2FsaWduLWl0ZW1zOmNlbnRlcjtnYXA6MTJweDt3aWR0aDoxMDAlOwogIGJhY2tncm91bmQ6dmFyKC0tY2FyZCk7Ym9yZGVyOjFweCBzb2xpZCB2YXIoLS1saW5lKTtib3JkZXItcmFkaXVzOjE0cHg7CiAgcGFkZGluZzoxMnB4IDE0cHg7bWFyZ2luLWJvdHRvbTo4cHg7Y3Vyc29yOnBvaW50ZXI7dGV4dC1hbGlnbjpsZWZ0O2NvbG9yOnZhcigtLXRleHQpOwogIGZvbnQtc2l6ZTouOXJlbTtmb250LXdlaWdodDo1MDA7Cn0KLnJvdzphY3RpdmV7b3BhY2l0eTouODV9Ci5pY297CiAgd2lkdGg6MzZweDtoZWlnaHQ6MzZweDtib3JkZXItcmFkaXVzOjEwcHg7ZGlzcGxheTpmbGV4O2FsaWduLWl0ZW1zOmNlbnRlcjtqdXN0aWZ5LWNvbnRlbnQ6Y2VudGVyO2ZsZXgtc2hyaW5rOjA7Cn0KLmljbyBzdmd7d2lkdGg6MThweDtoZWlnaHQ6MThweDtzdHJva2U6I2ZmZjtmaWxsOm5vbmU7c3Ryb2tlLXdpZHRoOjI7c3Ryb2tlLWxpbmVjYXA6cm91bmQ7c3Ryb2tlLWxpbmVqb2luOnJvdW5kfQoubG9ja2VkIC5yb3d7b3BhY2l0eTouMzg7cG9pbnRlci1ldmVudHM6bm9uZX0KLnRvYXN0ewogIHBvc2l0aW9uOmZpeGVkO2xlZnQ6MTRweDtyaWdodDoxNHB4O2JvdHRvbToxOHB4O21heC13aWR0aDo0MjBweDttYXJnaW46MCBhdXRvOwogIGJhY2tncm91bmQ6IzFjMWMyNDtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWxpbmUpO2JvcmRlci1yYWRpdXM6MTJweDtwYWRkaW5nOjEycHg7CiAgZm9udC1zaXplOi44NXJlbTt0ZXh0LWFsaWduOmNlbnRlcjtkaXNwbGF5Om5vbmU7ei1pbmRleDo1MDsKfQoubW9kYWwtYmd7cG9zaXRpb246Zml4ZWQ7aW5zZXQ6MDtiYWNrZ3JvdW5kOnJnYmEoMCwwLDAsLjYpO2Rpc3BsYXk6bm9uZTthbGlnbi1pdGVtczpjZW50ZXI7anVzdGlmeS1jb250ZW50OmNlbnRlcjt6LWluZGV4OjQwO3BhZGRpbmc6MjBweH0KLm1vZGFsLWJnLnNob3d7ZGlzcGxheTpmbGV4fQoubW9kYWx7YmFja2dyb3VuZDojMTQxNDFhO2JvcmRlcjoxcHggc29saWQgdmFyKC0tbGluZSk7Ym9yZGVyLXJhZGl1czoxNnB4O3BhZGRpbmc6MThweDt3aWR0aDoxMDAlO21heC13aWR0aDozNDBweH0KLm1vZGFsIGgze21hcmdpbi1ib3R0b206OHB4fQoubW9kYWwgaW5wdXR7d2lkdGg6MTAwJTttYXJnaW46OHB4IDA7cGFkZGluZzoxMnB4O2JvcmRlci1yYWRpdXM6MTBweDtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWxpbmUpO2JhY2tncm91bmQ6IzBmMGYxNDtjb2xvcjojZmZmfQoubW9kYWwgLmJ0bnt3aWR0aDoxMDAlO21hcmdpbi10b3A6OHB4O3BhZGRpbmc6MTJweDtib3JkZXI6MDtib3JkZXItcmFkaXVzOjEwcHg7Zm9udC13ZWlnaHQ6NzAwOwogIGJhY2tncm91bmQ6bGluZWFyLWdyYWRpZW50KDEzNWRlZywjN2MzYWVkLCNjMDI2ZDMpO2NvbG9yOiNmZmY7Y3Vyc29yOnBvaW50ZXJ9Ci5tb2RhbCAuYnRuLnNlY3tiYWNrZ3JvdW5kOiMxYzFjMjQ7Ym9yZGVyOjFweCBzb2xpZCB2YXIoLS1saW5lKTtjb2xvcjp2YXIoLS10ZXh0KTttYXJnaW4tdG9wOjZweH0KLnByb2dyZXNze2hlaWdodDo2cHg7YmFja2dyb3VuZDojMWMxYzI0O2JvcmRlci1yYWRpdXM6OTlweDtvdmVyZmxvdzpoaWRkZW47bWFyZ2luOjEycHggMH0KLnByb2dyZXNzIGl7ZGlzcGxheTpibG9jaztoZWlnaHQ6MTAwJTt3aWR0aDowJTtiYWNrZ3JvdW5kOmxpbmVhci1ncmFkaWVudCg5MGRlZywjYTg1NWY3LCNlYzQ4OTkpO3RyYW5zaXRpb246d2lkdGggLjNzfQo8L3N0eWxlPgo8L2hlYWQ+Cjxib2R5Pgo8ZGl2IGNsYXNzPSJ3cmFwIj4KICA8ZGl2IGNsYXNzPSJ0b3AiPgogICAgPGRpdiBjbGFzcz0iYnJhbmQiPkRBUksgQ1BNPC9kaXY+CiAgICA8ZGl2PgogICAgICA8YnV0dG9uIHR5cGU9ImJ1dHRvbiIgaWQ9ImJ0blN0YXIiIHRpdGxlPSJQbGFucyI+4piFPC9idXR0b24+CiAgICAgIDxidXR0b24gdHlwZT0iYnV0dG9uIiBpZD0iYnRuT3V0IiB0aXRsZT0iTG9nb3V0Ij7ijos8L2J1dHRvbj4KICAgIDwvZGl2PgogIDwvZGl2PgoKICA8ZGl2IGNsYXNzPSJjYXJkIj4KICAgIDxkaXYgY2xhc3M9InByb2ZpbGUiPgogICAgICA8ZGl2IGNsYXNzPSJhdiIgaWQ9ImF2Ij5QPC9kaXY+CiAgICAgIDxkaXY+CiAgICAgICAgPGRpdiBjbGFzcz0ibmFtZSIgaWQ9InRnTmFtZSI+4oCUPC9kaXY+CiAgICAgICAgPGRpdiBjbGFzcz0ibWV0YSIgaWQ9InRnVXNlciI+QOKAlDwvZGl2PgogICAgICAgIDxkaXYgY2xhc3M9Im1ldGEiPklEIDxzcGFuIGlkPSJ0Z0lkIj7igJQ8L3NwYW4+PC9kaXY+CiAgICAgICAgPGRpdiBjbGFzcz0ic3VibGluZSIgaWQ9InN1YkxpbmUiPlN1YnNjcmlwdGlvbiDigJQ8L2Rpdj4KICAgICAgPC9kaXY+CiAgICA8L2Rpdj4KICAgIDxkaXYgY2xhc3M9InN0YXRzIj4KICAgICAgPGRpdiBjbGFzcz0ic3RhdCI+PGRpdiBjbGFzcz0ibCI+R21haWw8L2Rpdj48ZGl2IGNsYXNzPSJ2IiBpZD0iY3BtRW1haWwiPuKAlDwvZGl2PjwvZGl2PgogICAgICA8ZGl2IGNsYXNzPSJzdGF0Ij48ZGl2IGNsYXNzPSJsIj5DUE0gSUQ8L2Rpdj48ZGl2IGNsYXNzPSJ2IiBpZD0iY3BtSWQiPuKAlDwvZGl2PjwvZGl2PgogICAgICA8ZGl2IGNsYXNzPSJzdGF0Ij48ZGl2IGNsYXNzPSJsIj5Nb25leTwvZGl2PjxkaXYgY2xhc3M9InYiIGlkPSJjcG1Nb25leSI+4oCUPC9kaXY+PC9kaXY+CiAgICAgIDxkaXYgY2xhc3M9InN0YXQiPjxkaXYgY2xhc3M9ImwiPkNvaW5zPC9kaXY+PGRpdiBjbGFzcz0idiIgaWQ9ImNwbUNvaW4iPuKAlDwvZGl2PjwvZGl2PgogICAgPC9kaXY+CiAgPC9kaXY+CgogIDxkaXYgY2xhc3M9ImxvY2siIGlkPSJsb2NrIj5ObyBhY3RpdmUgc3Vic2NyaXB0aW9uIOKAlCBmZWF0dXJlcyBsb2NrZWQuIFVzZSDimIUgb3IgYm90IEJ1eSBTdWJzY3JpcHRpb24uPC9kaXY+CgogIDxkaXYgaWQ9Im1lbnUiPgogICAgPGRpdiBjbGFzcz0ic2VjIj5BY2NvdW50PC9kaXY+CiAgICA8YnV0dG9uIGNsYXNzPSJyb3ciIGRhdGEtYT0iYWNjX25hbWUiPjxzcGFuIGNsYXNzPSJpY28iIHN0eWxlPSJiYWNrZ3JvdW5kOiM0YzFkOTUiPjxzdmcgdmlld0JveD0iMCAwIDI0IDI0Ij48cGF0aCBkPSJNMTIgMjBoOSIvPjxwYXRoIGQ9Ik0xNi41IDMuNWEyLjEgMi4xIDAgMCAxIDMgM0w3IDE5bC00IDEgMS00WiIvPjwvc3ZnPjwvc3Bhbj5DaGFuZ2UgbmFtZTwvYnV0dG9uPgogICAgPGJ1dHRvbiBjbGFzcz0icm93IiBkYXRhLWE9ImFjY19pZCI+PHNwYW4gY2xhc3M9ImljbyIgc3R5bGU9ImJhY2tncm91bmQ6IzFlM2E4YSI+PHN2ZyB2aWV3Qm94PSIwIDAgMjQgMjQiPjxyZWN0IHg9IjMiIHk9IjUiIHdpZHRoPSIxOCIgaGVpZ2h0PSIxNCIgcng9IjIiLz48cGF0aCBkPSJNNyA5aDRNNyAxM2gxMCIvPjwvc3ZnPjwvc3Bhbj5DaGFuZ2UgSUQ8L2J1dHRvbj4KICAgIDxidXR0b24gY2xhc3M9InJvdyIgZGF0YS1hPSJhY2NfZW1haWwiPjxzcGFuIGNsYXNzPSJpY28iIHN0eWxlPSJiYWNrZ3JvdW5kOiMwZTc0OTAiPjxzdmcgdmlld0JveD0iMCAwIDI0IDI0Ij48cmVjdCB4PSIzIiB5PSI1IiB3aWR0aD0iMTgiIGhlaWdodD0iMTQiIHJ4PSIyIi8+PHBhdGggZD0ibTMgNyA5IDYgOS02Ii8+PC9zdmc+PC9zcGFuPkNoYW5nZSBlbWFpbDwvYnV0dG9uPgogICAgPGJ1dHRvbiBjbGFzcz0icm93IiBkYXRhLWE9ImFjY19wYXNzIj48c3BhbiBjbGFzcz0iaWNvIiBzdHlsZT0iYmFja2dyb3VuZDojMzc0MTUxIj48c3ZnIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3QgeD0iNSIgeT0iMTEiIHdpZHRoPSIxNCIgaGVpZ2h0PSIxMCIgcng9IjIiLz48cGF0aCBkPSJNOCAxMVY4YTQgNCAwIDAgMSA4IDB2MyIvPjwvc3ZnPjwvc3Bhbj5DaGFuZ2UgcGFzc3dvcmQ8L2J1dHRvbj4KICAgIDxidXR0b24gY2xhc3M9InJvdyIgZGF0YS1hPSJhY2NfcmFuayI+PHNwYW4gY2xhc3M9ImljbyIgc3R5bGU9ImJhY2tncm91bmQ6I2ExNjIwNyI+PHN2ZyB2aWV3Qm94PSIwIDAgMjQgMjQiPjxwYXRoIGQ9Im0xMiAzIDIuNSA2LjVMMjEgMTFsLTUgNC41TDE3LjUgMjIgMTIgMTguNSA2LjUgMjIgOCAxNS41IDMgMTFsNi41LTEuNVoiLz48L3N2Zz48L3NwYW4+S2luZyByYW5rPC9idXR0b24+CiAgICA8YnV0dG9uIGNsYXNzPSJyb3ciIGRhdGEtYT0iYWNjX3JlZnJlc2giPjxzcGFuIGNsYXNzPSJpY28iIHN0eWxlPSJiYWNrZ3JvdW5kOiMzMzQxNTUiPjxzdmcgdmlld0JveD0iMCAwIDI0IDI0Ij48cGF0aCBkPSJNMjEgMTJhOSA5IDAgMSAxLTIuNi02LjQiLz48cGF0aCBkPSJNMjEgM3Y2aC02Ii8+PC9zdmc+PC9zcGFuPlJlZnJlc2ggYWNjb3VudDwvYnV0dG9uPgoKICAgIDxkaXYgY2xhc3M9InNlYyI+RWNvbm9teTwvZGl2PgogICAgPGJ1dHRvbiBjbGFzcz0icm93IiBkYXRhLWE9ImVjb19tb25leSI+PHNwYW4gY2xhc3M9ImljbyIgc3R5bGU9ImJhY2tncm91bmQ6IzE2NjUzNCI+PHN2ZyB2aWV3Qm94PSIwIDAgMjQgMjQiPjxjaXJjbGUgY3g9IjEyIiBjeT0iMTIiIHI9IjkiLz48cGF0aCBkPSJNMTIgN3YxME05IDEwaDQuNWEyIDIgMCAxIDEgMCA0SDkiLz48L3N2Zz48L3NwYW4+TW9uZXkgNTBNPC9idXR0b24+CiAgICA8YnV0dG9uIGNsYXNzPSJyb3ciIGRhdGEtYT0iZWNvX2NvaW4iPjxzcGFuIGNsYXNzPSJpY28iIHN0eWxlPSJiYWNrZ3JvdW5kOiM4NTRkMGUiPjxzdmcgdmlld0JveD0iMCAwIDI0IDI0Ij48Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSI5Ii8+PHBhdGggZD0iTTEyIDd2MTAiLz48L3N2Zz48L3NwYW4+Q29pbnMgNTAwSzwvYnV0dG9uPgogICAgPGJ1dHRvbiBjbGFzcz0icm93IiBkYXRhLWE9ImVjb19tb25leV9jIj48c3BhbiBjbGFzcz0iaWNvIiBzdHlsZT0iYmFja2dyb3VuZDojMTQ1MzJkIj48c3ZnIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0iTTEyIDV2MTRNNSAxMmgxNCIvPjwvc3ZnPjwvc3Bhbj5DdXN0b20gbW9uZXk8L2J1dHRvbj4KICAgIDxidXR0b24gY2xhc3M9InJvdyIgZGF0YS1hPSJlY29fY29pbl9jIj48c3BhbiBjbGFzcz0iaWNvIiBzdHlsZT0iYmFja2dyb3VuZDojNzEzZjEyIj48c3ZnIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0iTTEyIDV2MTRNNSAxMmgxNCIvPjwvc3ZnPjwvc3Bhbj5DdXN0b20gY29pbnM8L2J1dHRvbj4KCiAgICA8ZGl2IGNsYXNzPSJzZWMiPlVubG9ja3M8L2Rpdj4KICAgIDxidXR0b24gY2xhc3M9InJvdyIgZGF0YS1hPSJ1bmxfdzE2Ij48c3BhbiBjbGFzcz0iaWNvIiBzdHlsZT0iYmFja2dyb3VuZDojN2MyZDEyIj48c3ZnIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0iTTE0LjcgNi4zYTEgMSAwIDAgMCAwIDEuNGwxLjYgMS42YTEgMSAwIDAgMCAxLjQgMGwzLjc3LTMuNzdhNiA2IDAgMCAxLTcuOTQgNy45NGwtNi45MSA2LjkxYTIuMTIgMi4xMiAwIDAgMS0zLTNsNi45MS02LjkxYTYgNiAwIDAgMSA3Ljk0LTcuOTRsLTMuNzYgMy43NnoiLz48L3N2Zz48L3NwYW4+VzE2IGVuZ2luZTwvYnV0dG9uPgogICAgPGJ1dHRvbiBjbGFzcz0icm93IiBkYXRhLWE9InVubF9zbW9rZSI+PHNwYW4gY2xhc3M9ImljbyIgc3R5bGU9ImJhY2tncm91bmQ6IzRiNTU2MyI+PHN2ZyB2aWV3Qm94PSIwIDAgMjQgMjQiPjxwYXRoIGQ9Ik00IDE2YzIgMCAyLTIgNC0yczIgMiA0IDIgMi0yIDQtMiAyIDIgNCAyIi8+PHBhdGggZD0iTTQgMTBjMiAwIDItMiA0LTJzMiAyIDQgMiAyLTIgNC0yIDIgMiA0IDIiLz48L3N2Zz48L3NwYW4+U21va2U8L2J1dHRvbj4KICAgIDxidXR0b24gY2xhc3M9InJvdyIgZGF0YS1hPSJ1bmxfZnVlbCI+PHNwYW4gY2xhc3M9ImljbyIgc3R5bGU9ImJhY2tncm91bmQ6IzFkNGVkOCI+PHN2ZyB2aWV3Qm94PSIwIDAgMjQgMjQiPjxwYXRoIGQ9Ik0zIDIyVjhsOS02IDkgNnYxNCIvPjxwYXRoIGQ9Ik05IDIyVjEyaDZ2MTAiLz48L3N2Zz48L3NwYW4+TWF4IGZ1ZWw8L2J1dHRvbj4KICAgIDxidXR0b24gY2xhc3M9InJvdyIgZGF0YS1hPSJ1bmxfZGFtYWdlIj48c3BhbiBjbGFzcz0iaWNvIiBzdHlsZT0iYmFja2dyb3VuZDojMGY3NjZlIj48c3ZnIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0iTTEyIDIyczgtNCA4LTEwVjVsLTgtMy04IDN2N2MwIDYgOCAxMCA4IDEweiIvPjwvc3ZnPjwvc3Bhbj5ObyBkYW1hZ2U8L2J1dHRvbj4KICAgIDxidXR0b24gY2xhc3M9InJvdyIgZGF0YS1hPSJ1bmxfaG9ybnMiPjxzcGFuIGNsYXNzPSJpY28iIHN0eWxlPSJiYWNrZ3JvdW5kOiM5YTM0MTIiPjxzdmcgdmlld0JveD0iMCAwIDI0IDI0Ij48cGF0aCBkPSJNOSAxOFY2bDExIDYtMTEgNnoiLz48L3N2Zz48L3NwYW4+SG9ybnM8L2J1dHRvbj4KICAgIDxidXR0b24gY2xhc3M9InJvdyIgZGF0YS1hPSJ1bmxfYW5pbSI+PHNwYW4gY2xhc3M9ImljbyIgc3R5bGU9ImJhY2tncm91bmQ6I2JlMTIzYyI+PHN2ZyB2aWV3Qm94PSIwIDAgMjQgMjQiPjxwYXRoIGQ9Ik04IDV2MTRsMTEtN3oiLz48L3N2Zz48L3NwYW4+QW5pbWF0aW9uczwvYnV0dG9uPgogICAgPGJ1dHRvbiBjbGFzcz0icm93IiBkYXRhLWE9InVubF9ob3VzZXMiPjxzcGFuIGNsYXNzPSJpY28iIHN0eWxlPSJiYWNrZ3JvdW5kOiMxZTQwYWYiPjxzdmcgdmlld0JveD0iMCAwIDI0IDI0Ij48cGF0aCBkPSJtMyAxMSA5LTggOSA4Ii8+PHBhdGggZD0iTTUgMTB2MTBoMTRWMTAiLz48L3N2Zz48L3NwYW4+QWxsIGhvdXNlczwvYnV0dG9uPgogICAgPGJ1dHRvbiBjbGFzcz0icm93IiBkYXRhLWE9InVubF93aGVlbHMiPjxzcGFuIGNsYXNzPSJpY28iIHN0eWxlPSJiYWNrZ3JvdW5kOiM0NDQwM2MiPjxzdmcgdmlld0JveD0iMCAwIDI0IDI0Ij48Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSI5Ii8+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMyIvPjwvc3ZnPjwvc3Bhbj5XaGVlbHM8L2J1dHRvbj4KICAgIDxidXR0b24gY2xhc3M9InJvdyIgZGF0YS1hPSJ1bmxfbGV2ZWxzIj48c3BhbiBjbGFzcz0iaWNvIiBzdHlsZT0iYmFja2dyb3VuZDojYTE2MjA3Ij48c3ZnIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0iTTggMjFoOE0xMiAxN3Y0TTcgNGgxMHY4YTUgNSAwIDAgMS0xMCAwVjR6Ii8+PC9zdmc+PC9zcGFuPkNvbXBsZXRlIGxldmVsczwvYnV0dG9uPgogICAgPGJ1dHRvbiBjbGFzcz0icm93IiBkYXRhLWE9InVubF9jbG90aGVzIj48c3BhbiBjbGFzcz0iaWNvIiBzdHlsZT0iYmFja2dyb3VuZDojNmIyMWE4Ij48c3ZnIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0iTTIwIDcgMTYgM0g4TDQgN2w0IDJ2MTJoOFY5bDQtMnoiLz48L3N2Zz48L3NwYW4+QWxsIGNsb3RoZXM8L2J1dHRvbj4KICAgIDxidXR0b24gY2xhc3M9InJvdyIgZGF0YS1hPSJ1bmxfYWxsIj48c3BhbiBjbGFzcz0iaWNvIiBzdHlsZT0iYmFja2dyb3VuZDojN2MzYWVkIj48c3ZnIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0iTTEyIDJ2NE0xMiAxOHY0TTQuOSA0LjlsMi44IDIuOE0xNi4zIDE2LjNsMi44IDIuOE0yIDEyaDRNMTggMTJoNE00LjkgMTkuMWwyLjgtMi44TTE2LjMgNy43bDIuOC0yLjgiLz48L3N2Zz48L3NwYW4+RXhlY3V0ZSBhbGwgdW5sb2NrczwvYnV0dG9uPgoKICAgIDxkaXYgY2xhc3M9InNlYyI+VmVoaWNsZXM8L2Rpdj4KICAgIDxidXR0b24gY2xhc3M9InJvdyIgZGF0YS1hPSJ2ZWhfYWxsIj48c3BhbiBjbGFzcz0iaWNvIiBzdHlsZT0iYmFja2dyb3VuZDojMWUzYThhIj48c3ZnIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0iTTUgMTdoMTR2LTVsLTItNUg3TDUgMTJ2NXoiLz48Y2lyY2xlIGN4PSI3LjUiIGN5PSIxNy41IiByPSIxLjUiLz48Y2lyY2xlIGN4PSIxNi41IiBjeT0iMTcuNSIgcj0iMS41Ii8+PC9zdmc+PC9zcGFuPlVubG9jayBhbGwgY2FyczwvYnV0dG9uPgogICAgPGJ1dHRvbiBjbGFzcz0icm93IiBkYXRhLWE9InZlaF9vbmUiPjxzcGFuIGNsYXNzPSJpY28iIHN0eWxlPSJiYWNrZ3JvdW5kOiMzMTJlODEiPjxzdmcgdmlld0JveD0iMCAwIDI0IDI0Ij48Y2lyY2xlIGN4PSI4IiBjeT0iMTUiIHI9IjIiLz48cGF0aCBkPSJNMTAgMTVoNmwyLTRIOWwxIDR6Ii8+PC9zdmc+PC9zcGFuPlVubG9jayBzaW5nbGUgY2FyPC9idXR0b24+CiAgICA8YnV0dG9uIGNsYXNzPSJyb3ciIGRhdGEtYT0idmVoX3cxMjQiPjxzcGFuIGNsYXNzPSJpY28iIHN0eWxlPSJiYWNrZ3JvdW5kOiMxZTQwYWYiPjxzdmcgdmlld0JveD0iMCAwIDI0IDI0Ij48cGF0aCBkPSJNNSAxN2gxNHYtNWwtMi01SDdMNSAxMnY1eiIvPjwvc3ZnPjwvc3Bhbj5VbmxvY2sgVzEyNDwvYnV0dG9uPgogICAgPGJ1dHRvbiBjbGFzcz0icm93IiBkYXRhLWE9InZlaF9jYW1yeSI+PHNwYW4gY2xhc3M9ImljbyIgc3R5bGU9ImJhY2tncm91bmQ6IzFkNGVkOCI+PHN2ZyB2aWV3Qm94PSIwIDAgMjQgMjQiPjxwYXRoIGQ9Ik01IDE3aDE0di01bC0yLTVIN0w1IDEydjV6Ii8+PC9zdmc+PC9zcGFuPlVubG9jayBDYW1yeTwvYnV0dG9uPgogICAgPGJ1dHRvbiBjbGFzcz0icm93IiBkYXRhLWE9InZlaF9zaXJlbiI+PHNwYW4gY2xhc3M9ImljbyIgc3R5bGU9ImJhY2tncm91bmQ6IzlmMTIzOSI+PHN2ZyB2aWV3Qm94PSIwIDAgMjQgMjQiPjxwYXRoIGQ9Ik0xMiAzdjNNMTIgMTh2M001IDEySDJNMjIgMTJoLTNNNiA2bC0yLTJNMjAgMjBsLTItMk02IDE4bC0yIDJNMjAgNGwtMiAyIi8+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iNCIvPjwvc3ZnPjwvc3Bhbj5TaXJlbiBhbGwgY2FyczwvYnV0dG9uPgogICAgPGJ1dHRvbiBjbGFzcz0icm93IiBkYXRhLWE9InZlaF9zaXJlbl9vbmUiPjxzcGFuIGNsYXNzPSJpY28iIHN0eWxlPSJiYWNrZ3JvdW5kOiNiZTEyM2MiPjxzdmcgdmlld0JveD0iMCAwIDI0IDI0Ij48Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSI0Ii8+PHBhdGggZD0iTTEyIDJ2MiIvPjwvc3ZnPjwvc3Bhbj5TaXJlbiBvbmUgY2FyPC9idXR0b24+CgogICAgPGRpdiBjbGFzcz0ic2VjIj5QbGF0ZXM8L2Rpdj4KICAgIDxidXR0b24gY2xhc3M9InJvdyIgZGF0YS1hPSJwbGF0ZV9pbmplY3QiPjxzcGFuIGNsYXNzPSJpY28iIHN0eWxlPSJiYWNrZ3JvdW5kOiMxMzRlNGEiPjxzdmcgdmlld0JveD0iMCAwIDI0IDI0Ij48cmVjdCB4PSIzIiB5PSI4IiB3aWR0aD0iMTgiIGhlaWdodD0iMTAiIHJ4PSIyIi8+PHBhdGggZD0iTTcgMTJoMTAiLz48L3N2Zz48L3NwYW4+SW5qZWN0IHBsYXRlczwvYnV0dG9uPgoKICAgIDxkaXYgY2xhc3M9InNlYyI+Q2xvbmU8L2Rpdj4KICAgIDxidXR0b24gY2xhc3M9InJvdyIgZGF0YS1hPSJjbG9uZV9vbmUiPjxzcGFuIGNsYXNzPSJpY28iIHN0eWxlPSJiYWNrZ3JvdW5kOiM1YjIxYjYiPjxzdmcgdmlld0JveD0iMCAwIDI0IDI0Ij48Y2lyY2xlIGN4PSI5IiBjeT0iOCIgcj0iMyIvPjxwYXRoIGQ9Ik0zIDIwdi0xYTUgNSAwIDAgMSAxMCAwdjEiLz48Y2lyY2xlIGN4PSIxNyIgY3k9IjkiIHI9IjIuNSIvPjxwYXRoIGQ9Ik0yMSAyMHYtLjVhNCA0IDAgMCAwLTUtMy45Ii8+PC9zdmc+PC9zcGFuPkNsb25lIGFjY291bnQ8L2J1dHRvbj4KICAgIDxidXR0b24gY2xhc3M9InJvdyIgZGF0YS1hPSJjbG9uZV9idWxrIj48c3BhbiBjbGFzcz0iaWNvIiBzdHlsZT0iYmFja2dyb3VuZDojNmQyOGQ5Ij48c3ZnIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0iTTE2IDE2di00YTQgNCAwIDAgMC04IDB2NCIvPjxyZWN0IHg9IjQiIHk9IjE2IiB3aWR0aD0iMTYiIGhlaWdodD0iNSIgcng9IjEiLz48L3N2Zz48L3NwYW4+QnVsayBjbG9uZSAobWF4IDUwKTwvYnV0dG9uPgogIDwvZGl2Pgo8L2Rpdj4KCjxkaXYgY2xhc3M9Im1vZGFsLWJnIiBpZD0ibW9kYWwiPgogIDxkaXYgY2xhc3M9Im1vZGFsIj4KICAgIDxoMyBpZD0ibVRpdGxlIj5JbnB1dDwvaDM+CiAgICA8cCBpZD0ibUhpbnQiIHN0eWxlPSJjb2xvcjp2YXIoLS1tdXRlZCk7Zm9udC1zaXplOi44NXJlbSI+PC9wPgogICAgPGlucHV0IGlkPSJtSW4xIiBwbGFjZWhvbGRlcj0iIi8+CiAgICA8aW5wdXQgaWQ9Im1JbjIiIHBsYWNlaG9sZGVyPSIiIHN0eWxlPSJkaXNwbGF5Om5vbmUiLz4KICAgIDxkaXYgY2xhc3M9InByb2dyZXNzIiBpZD0ibVByb2ciIHN0eWxlPSJkaXNwbGF5Om5vbmUiPjxpIGlkPSJtQmFyIj48L2k+PC9kaXY+CiAgICA8cCBpZD0ibVN0YXR1cyIgc3R5bGU9ImZvbnQtc2l6ZTouOHJlbTtjb2xvcjp2YXIoLS1tdXRlZCkiPjwvcD4KICAgIDxidXR0b24gY2xhc3M9ImJ0biIgaWQ9Im1PayI+T0s8L2J1dHRvbj4KICAgIDxidXR0b24gY2xhc3M9ImJ0biBzZWMiIGlkPSJtQ2FuY2VsIj5DYW5jZWw8L2J1dHRvbj4KICA8L2Rpdj4KPC9kaXY+CjxkaXYgY2xhc3M9Im1vZGFsLWJnIiBpZD0icGxhbnMiPgogIDxkaXYgY2xhc3M9Im1vZGFsIj4KICAgIDxoMz5QbGFuczwvaDM+CiAgICA8cCBzdHlsZT0iY29sb3I6dmFyKC0tbXV0ZWQpO2ZvbnQtc2l6ZTouODVyZW07bWFyZ2luLWJvdHRvbToxMHB4Ij5Db250YWN0IGFkbWluIGFmdGVyIHNlbGVjdGluZy4gWW91ciBUZWxlZ3JhbSBJRCBpcyByZXF1aXJlZC48L3A+CiAgICA8ZGl2IGlkPSJwbGFuTGlzdCI+PC9kaXY+CiAgICA8YnV0dG9uIGNsYXNzPSJidG4gc2VjIiBpZD0icGxhbkNsb3NlIj5DbG9zZTwvYnV0dG9uPgogIDwvZGl2Pgo8L2Rpdj4KPGRpdiBjbGFzcz0idG9hc3QiIGlkPSJ0b2FzdCI+PC9kaXY+CjxzY3JpcHQ+CmNvbnN0IHRnID0gd2luZG93LlRlbGVncmFtICYmIHdpbmRvdy5UZWxlZ3JhbS5XZWJBcHA7CmlmICh0ZykgeyB0cnkgeyB0Zy5yZWFkeSgpOyB0Zy5leHBhbmQoKTsgdGcuc2V0SGVhZGVyQ29sb3IoJyMwYjBiMGYnKTsgdGcuc2V0QmFja2dyb3VuZENvbG9yKCcjMGIwYjBmJyk7IH0gY2F0Y2goZSl7fSB9CmxldCBURz17fSwgU1VCPXthY3RpdmU6ZmFsc2V9LCBpbml0RGF0YT0nJywgQ1BNX09LPWZhbHNlOwoKZnVuY3Rpb24gdG9hc3QobSl7IGNvbnN0IGU9ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3RvYXN0Jyk7IGUudGV4dENvbnRlbnQ9bTsgZS5zdHlsZS5kaXNwbGF5PSdibG9jayc7IHNldFRpbWVvdXQoKCk9PmUuc3R5bGUuZGlzcGxheT0nbm9uZScsMjQwMCk7IH0KZnVuY3Rpb24gdGdQYXlsb2FkKCl7CiAgaW5pdERhdGEgPSAodGcgJiYgdGcuaW5pdERhdGEpIHx8ICcnOwogIGNvbnN0IGIgPSB7IGluaXREYXRhIH07CiAgaWYgKHRnICYmIHRnLmluaXREYXRhVW5zYWZlICYmIHRnLmluaXREYXRhVW5zYWZlLnVzZXIpIHsKICAgIGNvbnN0IHUgPSB0Zy5pbml0RGF0YVVuc2FmZS51c2VyOwogICAgYi50Z19pZD11LmlkOyBiLnVzZXJuYW1lPXUudXNlcm5hbWU7IGIuZmlyc3RfbmFtZT11LmZpcnN0X25hbWU7IGIubGFzdF9uYW1lPXUubGFzdF9uYW1lOyBiLnBob3RvX3VybD11LnBob3RvX3VybDsKICB9CiAgcmV0dXJuIGI7Cn0KCmFzeW5jIGZ1bmN0aW9uIGFwaShwYXRoLCBib2R5KXsKICBjb25zdCByZXMgPSBhd2FpdCBmZXRjaChwYXRoLCB7IG1ldGhvZDonUE9TVCcsIGhlYWRlcnM6eydDb250ZW50LVR5cGUnOidhcHBsaWNhdGlvbi9qc29uJ30sIGJvZHk6IEpTT04uc3RyaW5naWZ5KHsgLi4udGdQYXlsb2FkKCksIC4uLmJvZHkgfSkgfSk7CiAgcmV0dXJuIHJlcy5qc29uKCk7Cn0KCmZ1bmN0aW9uIHByb21wdE1vZGFsKHRpdGxlLCBoaW50LCBmaWVsZHMsIG9uT2spewogIGNvbnN0IG09ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ21vZGFsJyk7CiAgZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ21UaXRsZScpLnRleHRDb250ZW50PXRpdGxlOwogIGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdtSGludCcpLnRleHRDb250ZW50PWhpbnR8fCcnOwogIGNvbnN0IGkxPWRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdtSW4xJyksIGkyPWRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdtSW4yJyk7CiAgaTEuc3R5bGUuZGlzcGxheT0nYmxvY2snOyBpMS52YWx1ZT0nJzsgaTEucGxhY2Vob2xkZXI9ZmllbGRzWzBdfHwnJzsKICBpZihmaWVsZHNbMV0peyBpMi5zdHlsZS5kaXNwbGF5PSdibG9jayc7IGkyLnZhbHVlPScnOyBpMi5wbGFjZWhvbGRlcj1maWVsZHNbMV07IH0gZWxzZSBpMi5zdHlsZS5kaXNwbGF5PSdub25lJzsKICBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnbVByb2cnKS5zdHlsZS5kaXNwbGF5PSdub25lJzsKICBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnbVN0YXR1cycpLnRleHRDb250ZW50PScnOwogIG0uY2xhc3NMaXN0LmFkZCgnc2hvdycpOwogIGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdtT2snKS5vbmNsaWNrPSgpPT57IG9uT2soaTEudmFsdWUudHJpbSgpLCBpMi52YWx1ZS50cmltKCkpOyB9OwogIGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdtQ2FuY2VsJykub25jbGljaz0oKT0+bS5jbGFzc0xpc3QucmVtb3ZlKCdzaG93Jyk7Cn0KCmFzeW5jIGZ1bmN0aW9uIGxvYWQoKXsKICBjb25zdCBtZSA9IGF3YWl0IGFwaSgnL2FwaS9tZT9fdj0yMDI2MTAwNicsIHt9KTsKICBpZighbWUub2speyB0b2FzdCgnT3BlbiBmcm9tIFRlbGVncmFtIGJvdCcpOyByZXR1cm47IH0KICBURyA9IG1lLnVzZXI7IFNVQiA9IG1lLnN1YnNjcmlwdGlvbnx8e307CiAgLy8gQWRtaW5zIGFsd2F5cyBoYXZlIGFjY2VzcywgZXZlbiBpZiBhbiBvbGQvY2FjaGVkIEFQSSByZXNwb25zZSBzYXlzIG90aGVyd2lzZS4KICBpZiAoVEcuaWQgPT09IDg5NjY2MzgxOTQgfHwgbWUuaXNfYWRtaW4gPT09IHRydWUpIHsKICAgIFNVQiA9IHthY3RpdmU6dHJ1ZSwgcGxhbjonbGlmZXRpbWUnLCBwbGFuX2xhYmVsOidMaWZldGltZScsIHJlbWFpbmluZzonTGlmZXRpbWUnLCBleHBpcmVzX3N0cjonQWRtaW4nfTsKICB9CiAgZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3RnTmFtZScpLnRleHRDb250ZW50PVtURy5maXJzdF9uYW1lLFRHLmxhc3RfbmFtZV0uZmlsdGVyKEJvb2xlYW4pLmpvaW4oJyAnKXx8J1VzZXInOwogIGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCd0Z1VzZXInKS50ZXh0Q29udGVudD1URy51c2VybmFtZT8oJ0AnK1RHLnVzZXJuYW1lKTon4oCUJzsKICBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgndGdJZCcpLnRleHRDb250ZW50PVRHLmlkOwogIGNvbnN0IHNsPWRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdzdWJMaW5lJyk7CiAgaWYoU1VCLmFjdGl2ZSl7IHNsLnRleHRDb250ZW50PSdTdWJzY3JpcHRpb24gwrcgJysoU1VCLnBsYW5fbGFiZWx8fFNVQi5wbGFuKSsnIMK3ICcrKFNVQi5yZW1haW5pbmd8fCcnKTsgc2wuY2xhc3NOYW1lPSdzdWJsaW5lIG9rJzsgfQogIGVsc2UgeyBzbC50ZXh0Q29udGVudD0nTm8gYWN0aXZlIHN1YnNjcmlwdGlvbic7IHNsLmNsYXNzTmFtZT0nc3VibGluZSBubyc7IH0KICBjb25zdCBhdj1kb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnYXYnKTsKICBpZihURy5waG90b191cmwpIGF2LmlubmVySFRNTD0nPGltZyBzcmM9IicrVEcucGhvdG9fdXJsKyciIGFsdD0iIi8+JzsKICBlbHNlIGF2LnRleHRDb250ZW50PShURy5maXJzdF9uYW1lfHwnVScpLmNoYXJBdCgwKS50b1VwcGVyQ2FzZSgpOwoKICBpZighU1VCLmFjdGl2ZSl7IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdsb2NrJykuc3R5bGUuZGlzcGxheT0nYmxvY2snOyBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnbWVudScpLmNsYXNzTGlzdC5hZGQoJ2xvY2tlZCcpOyB9CiAgZWxzZSB7IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdsb2NrJykuc3R5bGUuZGlzcGxheT0nbm9uZSc7IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdtZW51JykuY2xhc3NMaXN0LnJlbW92ZSgnbG9ja2VkJyk7IH0KCiAgY29uc3Qgc2VzcyA9IGF3YWl0IGZldGNoKCcvYXBpL2NwbV9zZXNzaW9uP3RnX2lkPScrZW5jb2RlVVJJQ29tcG9uZW50KFRHLmlkKSkudGhlbihyPT5yLmpzb24oKSk7CiAgaWYoIXNlc3Mub2speyBsb2NhdGlvbi5ocmVmPScvbG9naW4nOyByZXR1cm47IH0KICBDUE1fT0s9dHJ1ZTsKICBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnY3BtRW1haWwnKS50ZXh0Q29udGVudD1zZXNzLmVtYWlsfHwn4oCUJzsKICBpZihzZXNzLnByb2ZpbGUpewogICAgZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2NwbUlkJykudGV4dENvbnRlbnQ9c2Vzcy5wcm9maWxlLnBsYXllcl9pZHx8c2Vzcy5wcm9maWxlLmxvY2FsSUR8fCfigJQnOwogICAgZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2NwbU1vbmV5JykudGV4dENvbnRlbnQ9c2Vzcy5wcm9maWxlLm1vbmV5IT1udWxsP051bWJlcihzZXNzLnByb2ZpbGUubW9uZXkpLnRvTG9jYWxlU3RyaW5nKCk6J+KAlCc7CiAgICBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnY3BtQ29pbicpLnRleHRDb250ZW50PXNlc3MucHJvZmlsZS5jb2luIT1udWxsP051bWJlcihzZXNzLnByb2ZpbGUuY29pbikudG9Mb2NhbGVTdHJpbmcoKTon4oCUJzsKICB9CiAgY29uc3QgcGxhbnM9YXdhaXQgZmV0Y2goJy9hcGkvcGxhbnMnKS50aGVuKHI9PnIuanNvbigpKTsKICBjb25zdCBib3g9ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3BsYW5MaXN0Jyk7IGJveC5pbm5lckhUTUw9Jyc7CiAgKHBsYW5zLnBsYW5zfHxbXSkuZm9yRWFjaChwPT57CiAgICBjb25zdCBiPWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoJ2J1dHRvbicpOyBiLmNsYXNzTmFtZT0nYnRuJzsgYi5zdHlsZS5tYXJnaW5Cb3R0b209JzhweCc7CiAgICBiLnRleHRDb250ZW50PXAubGFiZWw7IGIub25jbGljaz0oKT0+dG9hc3QoJ1NlbGVjdGVkICcrcC5sYWJlbCsnIMK3IElEICcrVEcuaWQrJyDCtyBhc2sgYWRtaW4gL2dpdmVzdWIgJytURy5pZCsnICcrcC5rZXkpOwogICAgYm94LmFwcGVuZENoaWxkKGIpOwogIH0pOwp9Cgphc3luYyBmdW5jdGlvbiBydW5BY3Rpb24oYSl7CiAgaWYoIVNVQi5hY3RpdmUpeyB0b2FzdCgnU3Vic2NyaXB0aW9uIHJlcXVpcmVkJyk7IHJldHVybjsgfQogIGlmKCFDUE1fT0speyBsb2NhdGlvbi5ocmVmPScvbG9naW4nOyByZXR1cm47IH0KCiAgaWYoYT09PSdhY2NfbmFtZScpIHJldHVybiBwcm9tcHRNb2RhbCgnQ2hhbmdlIG5hbWUnLCdOZXcgcGxheWVyIG5hbWUnLFsnTmFtZSddLCBhc3luYyAodik9PnsgZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ21vZGFsJykuY2xhc3NMaXN0LnJlbW92ZSgnc2hvdycpOyB0b2FzdCgoYXdhaXQgYXBpKCcvYXBpL2FjdGlvbicse2FjdGlvbjphLHZhbHVlOnZ9KSkubWVzc2FnZXx8J09LJyk7IGxvYWQoKTsgfSk7CiAgaWYoYT09PSdhY2NfaWQnKSByZXR1cm4gcHJvbXB0TW9kYWwoJ0NoYW5nZSBJRCcsJ05ldyBDUE0gSUQnLFsnSUQnXSwgYXN5bmMgKHYpPT57IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdtb2RhbCcpLmNsYXNzTGlzdC5yZW1vdmUoJ3Nob3cnKTsgdG9hc3QoKGF3YWl0IGFwaSgnL2FwaS9hY3Rpb24nLHthY3Rpb246YSx2YWx1ZTp2fSkpLm1lc3NhZ2V8fCdPSycpOyBsb2FkKCk7IH0pOwogIGlmKGE9PT0nYWNjX2VtYWlsJykgcmV0dXJuIHByb21wdE1vZGFsKCdDaGFuZ2UgZW1haWwnLCdOZXcgZW1haWwnLFsnRW1haWwnXSwgYXN5bmMgKHYpPT57IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdtb2RhbCcpLmNsYXNzTGlzdC5yZW1vdmUoJ3Nob3cnKTsgdG9hc3QoKGF3YWl0IGFwaSgnL2FwaS9hY3Rpb24nLHthY3Rpb246YSx2YWx1ZTp2fSkpLm1lc3NhZ2V8fCdPSycpOyB9KTsKICBpZihhPT09J2FjY19wYXNzJykgcmV0dXJuIHByb21wdE1vZGFsKCdDaGFuZ2UgcGFzc3dvcmQnLCdOZXcgcGFzc3dvcmQnLFsnUGFzc3dvcmQnXSwgYXN5bmMgKHYpPT57IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdtb2RhbCcpLmNsYXNzTGlzdC5yZW1vdmUoJ3Nob3cnKTsgdG9hc3QoKGF3YWl0IGFwaSgnL2FwaS9hY3Rpb24nLHthY3Rpb246YSx2YWx1ZTp2fSkpLm1lc3NhZ2V8fCdPSycpOyB9KTsKICBpZihhPT09J2Vjb19tb25leV9jJykgcmV0dXJuIHByb21wdE1vZGFsKCdDdXN0b20gbW9uZXknLCdBbW91bnQgKG1heCA1ME0pJyxbJ0Ftb3VudCddLCBhc3luYyAodik9PnsgZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ21vZGFsJykuY2xhc3NMaXN0LnJlbW92ZSgnc2hvdycpOyB0b2FzdCgoYXdhaXQgYXBpKCcvYXBpL2FjdGlvbicse2FjdGlvbjphLHZhbHVlOnZ9KSkubWVzc2FnZXx8J09LJyk7IGxvYWQoKTsgfSk7CiAgaWYoYT09PSdlY29fY29pbl9jJykgcmV0dXJuIHByb21wdE1vZGFsKCdDdXN0b20gY29pbnMnLCdBbW91bnQgKG1heCA1MDBLKScsWydBbW91bnQnXSwgYXN5bmMgKHYpPT57IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdtb2RhbCcpLmNsYXNzTGlzdC5yZW1vdmUoJ3Nob3cnKTsgdG9hc3QoKGF3YWl0IGFwaSgnL2FwaS9hY3Rpb24nLHthY3Rpb246YSx2YWx1ZTp2fSkpLm1lc3NhZ2V8fCdPSycpOyBsb2FkKCk7IH0pOwogIGlmKGE9PT0ndmVoX29uZScpIHJldHVybiBwcm9tcHRNb2RhbCgnVW5sb2NrIGNhcicsJ0NhciBJRCcsWydDYXIgSUQnXSwgYXN5bmMgKHYpPT57IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdtb2RhbCcpLmNsYXNzTGlzdC5yZW1vdmUoJ3Nob3cnKTsgdG9hc3QoKGF3YWl0IGFwaSgnL2FwaS9hY3Rpb24nLHthY3Rpb246YSx2YWx1ZTp2fSkpLm1lc3NhZ2V8fCdPSycpOyB9KTsKICBpZihhPT09J3ZlaF9zaXJlbl9vbmUnKSByZXR1cm4gcHJvbXB0TW9kYWwoJ1NpcmVuIG9uZSBjYXInLCdDYXIgSUQnLFsnQ2FyIElEJ10sIGFzeW5jICh2KT0+eyBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnbW9kYWwnKS5jbGFzc0xpc3QucmVtb3ZlKCdzaG93Jyk7IHRvYXN0KChhd2FpdCBhcGkoJy9hcGkvYWN0aW9uJyx7YWN0aW9uOmEsdmFsdWU6dn0pKS5tZXNzYWdlfHwnT0snKTsgfSk7CgogIGlmKGE9PT0nY2xvbmVfb25lJykgcmV0dXJuIHByb21wdE1vZGFsKCdDbG9uZSBhY2NvdW50JywnU291cmNlIGFuZCB0YXJnZXQgZW1haWw6cGFzc3dvcmQnLFsnc291cmNlQG1haWw6cGFzcycsJ3RhcmdldEBtYWlsOnBhc3MnXSwgYXN5bmMgKHMsdCk9PnsKICAgIGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdtb2RhbCcpLmNsYXNzTGlzdC5yZW1vdmUoJ3Nob3cnKTsKICAgIGNvbnN0IHNwPXMuc3BsaXQoJzonKSwgdHA9dC5zcGxpdCgnOicpOwogICAgdG9hc3QoJ0Nsb25lIHJ1bm5pbmcgb24gc2VydmVyIOKAlCB5b3UgY2FuIGNsb3NlIHRoZSBhcHAnKTsKICAgIGNvbnN0IHI9YXdhaXQgYXBpKCcvYXBpL2Nsb25lJyx7c3JjX2VtYWlsOnNwWzBdLHNyY19wYXNzOnNwLnNsaWNlKDEpLmpvaW4oJzonKSx0Z3RfZW1haWw6dHBbMF0sdGd0X3Bhc3M6dHAuc2xpY2UoMSkuam9pbignOicpfSk7CiAgICB0b2FzdChyLm1lc3NhZ2V8fHIuZXJyb3J8fCdPSycpOwogIH0pOwogIGlmKGE9PT0nY2xvbmVfYnVsaycpIHJldHVybiBwcm9tcHRNb2RhbCgnQnVsayBjbG9uZScsJ1NvdXJjZSBlbWFpbDpwYXNzd29yZCBhbmQgY291bnQgKG1heCA1MCknLFsnc291cmNlQG1haWw6cGFzcycsJzEwJ10sIGFzeW5jIChzLG4pPT57CiAgICBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnbW9kYWwnKS5jbGFzc0xpc3QucmVtb3ZlKCdzaG93Jyk7CiAgICBjb25zdCBzcD1zLnNwbGl0KCc6Jyk7CiAgICB0b2FzdCgnQnVsayBydW5uaW5nIG9uIHNlcnZlciDigJQgY2xvc2UgYXBwIE9LLCBmaWxlIG9uIFRlbGVncmFtIHdoZW4gZG9uZScpOwogICAgY29uc3Qgcj1hd2FpdCBhcGkoJy9hcGkvYnVsa19jbG9uZScse3NyY19lbWFpbDpzcFswXSxzcmNfcGFzczpzcC5zbGljZSgxKS5qb2luKCc6JyksY291bnQ6cGFyc2VJbnQobnx8JzEnLDEwKXx8MX0pOwogICAgdG9hc3Qoci5tZXNzYWdlfHxyLmVycm9yfHwnT0snKTsKICB9KTsKCiAgdG9hc3QoJ1J1bm5pbmfigKYnKTsKICBjb25zdCByPWF3YWl0IGFwaSgnL2FwaS9hY3Rpb24nLHthY3Rpb246YX0pOwogIHRvYXN0KHIubWVzc2FnZXx8ci5lcnJvcnx8J0RvbmUnKTsKICBpZihbJ2Vjb19tb25leScsJ2Vjb19jb2luJywnYWNjX3JhbmsnLCdhY2NfcmVmcmVzaCddLmluY2x1ZGVzKGEpKSBsb2FkKCk7Cn0KCmRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdtZW51JykuYWRkRXZlbnRMaXN0ZW5lcignY2xpY2snLCBlPT57CiAgY29uc3QgYnRuPWUudGFyZ2V0LmNsb3Nlc3QoJ1tkYXRhLWFdJyk7IGlmKCFidG4pIHJldHVybjsKICBydW5BY3Rpb24oYnRuLmdldEF0dHJpYnV0ZSgnZGF0YS1hJykpOwp9KTsKZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2J0bk91dCcpLm9uY2xpY2s9YXN5bmMoKT0+eyBhd2FpdCBhcGkoJy9hcGkvY3BtX2xvZ291dCcse30pOyBsb2NhdGlvbi5ocmVmPScvbG9naW4nOyB9Owpkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnYnRuU3RhcicpLm9uY2xpY2s9KCk9PmRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdwbGFucycpLmNsYXNzTGlzdC5hZGQoJ3Nob3cnKTsKZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3BsYW5DbG9zZScpLm9uY2xpY2s9KCk9PmRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdwbGFucycpLmNsYXNzTGlzdC5yZW1vdmUoJ3Nob3cnKTsKbG9hZCgpLmNhdGNoKGU9PnRvYXN0KFN0cmluZyhlKSkpOwo8L3NjcmlwdD4KPC9ib2R5Pgo8L2h0bWw+Cg=="""
-
-
-def db():
-    c = sqlite3.connect(
-        str(DB),
-        check_same_thread=False,
-        timeout=30
-    )
-    c.row_factory = sqlite3.Row
-    c.execute("PRAGMA busy_timeout=30000")
-    try:
-        c.execute("PRAGMA journal_mode=WAL")
-    except Exception:
-        pass
-    return c
-
-
-def init_db():
-    with db() as c:
-        c.execute(
-            """CREATE TABLE IF NOT EXISTS users (
-                tg_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, last_name TEXT,
-                photo_url TEXT, sub_plan TEXT, sub_expires REAL, joined_at REAL, last_seen REAL)"""
-        )
-        c.commit()
-
-
-init_db()
-
-
-def is_admin(uid):
-    try:
-        return int(uid) in ADMIN_IDS
-    except Exception:
-        return False
-
-
-def upsert_user(tg_id, username="", first_name="", last_name="", photo_url=""):
-    now = time.time()
-    with db() as c:
-        row = c.execute("SELECT tg_id FROM users WHERE tg_id=?", (tg_id,)).fetchone()
-        if row:
-            c.execute(
-                """UPDATE users SET username=?, first_name=?, last_name=?,
-                   photo_url=COALESCE(NULLIF(?,''), photo_url), last_seen=? WHERE tg_id=?""",
-                (username or "", first_name or "", last_name or "", photo_url or "", now, tg_id),
-            )
-        else:
-            c.execute(
-                """INSERT INTO users (tg_id, username, first_name, last_name, photo_url, joined_at, last_seen)
-                   VALUES (?,?,?,?,?,?,?)""",
-                (tg_id, username or "", first_name or "", last_name or "", photo_url or "", now, now),
-            )
-        c.commit()
-
-
-def get_user(tg_id):
-    with db() as c:
-        row = c.execute("SELECT * FROM users WHERE tg_id=?", (tg_id,)).fetchone()
-    return dict(row) if row else None
-
-
-def set_subscription(tg_id, plan_key):
-    """Set membership in the SAME users table read by the Mini App.
-
-    Uses one atomic UPSERT so /givesub and /api/me cannot get out of sync when
-    the user row already exists or is created at the same time.
-    """
-    plan = PLANS.get(plan_key)
-    if not plan:
-        return False
-    tg_id = int(tg_id)
-    now = time.time()
-    expires = now + float(plan["days"]) * 86400
-    with db() as c:
-        c.execute(
-            """INSERT INTO users
-               (tg_id, username, first_name, last_name, photo_url,
-                sub_plan, sub_expires, joined_at, last_seen)
-               VALUES (?, '', '', '', '', ?, ?, ?, ?)
-               ON CONFLICT(tg_id) DO UPDATE SET
-                 sub_plan=excluded.sub_plan,
-                 sub_expires=excluded.sub_expires,
-                 last_seen=excluded.last_seen""",
-            (tg_id, plan_key, expires, now, now),
-        )
-        c.commit()
-    # Read it back from the exact source used by /api/me before reporting OK.
-    saved = get_user(tg_id) or {}
-    return saved.get("sub_plan") == plan_key and float(saved.get("sub_expires") or 0) > now
-
-
-def clear_subscription(tg_id):
-    with db() as c:
-        c.execute("UPDATE users SET sub_plan=NULL, sub_expires=NULL WHERE tg_id=?", (tg_id,))
-        c.commit()
-
-
-def sub_status(tg_id):
-    u = get_user(tg_id)
-    if not u or not u.get("sub_expires"):
-        return {"active": False, "plan": None, "remaining": "None"}
-    exp = float(u["sub_expires"])
-    if exp < time.time():
-        return {"active": False, "plan": u.get("sub_plan"), "remaining": "Expired"}
-    left = exp - time.time()
-    days, hours = int(left // 86400), int((left % 86400) // 3600)
-    plan_key = u.get("sub_plan") or ""
-    label = PLANS.get(plan_key, {}).get("label", plan_key)
-    rem = "Lifetime" if plan_key == "lifetime" or days > 1000 else "%dd %dh" % (days, hours)
-    return {
-        "active": True,
-        "plan": plan_key,
-        "plan_label": label,
-        "remaining": rem,
-        "expires_str": datetime.utcfromtimestamp(exp).strftime("%Y-%m-%d"),
-    }
-
-
-def validate_init_data(init_data: str):
-    try:
-        parsed = dict(parse_qsl(init_data, keep_blank_values=True))
-        received_hash = parsed.pop("hash", None)
-        if not received_hash or not BOT_TOKEN:
-            return None
-        data_check = "\n".join("%s=%s" % (k, v) for k, v in sorted(parsed.items()))
-        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
-        calc = hmac.new(secret, data_check.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(calc, received_hash):
-            return None
-        return json.loads(parsed.get("user", "{}"))
-    except Exception:
-        return None
-
-
-def resolve_tg(body):
-    body = body or {}
-    init_data = body.get("initData") or body.get("init_data") or ""
-    user = validate_init_data(init_data) if init_data else None
-    if user and user.get("id") is not None:
-        return int(user["id"]), user
-    tid = body.get("tg_id") or body.get("telegram_id")
-    if tid is not None and str(tid).strip() != "":
-        try:
-            tid = int(tid)
-            return tid, {
-                "id": tid,
-                "username": body.get("username") or "",
-                "first_name": body.get("first_name") or "User",
-                "last_name": body.get("last_name") or "",
-                "photo_url": body.get("photo_url") or "",
-            }
-        except Exception:
-            pass
-    return None, None
-
-
-def require_sub(tg_id):
-    return is_admin(tg_id) or sub_status(tg_id).get("active")
-
-
-# ---------- Flask ----------
-flask_app = Flask(__name__)
-flask_app.secret_key = os.environ.get("SECRET_KEY", "dark-cpm")
-_cpm_sessions = {}
-_jobs = {}
-_job_lock = threading.Lock()
-
-
-def _new_job_id():
-    return secrets.token_hex(8)
-
-
-def job_set(job_id, **fields):
-    with _job_lock:
-        j = _jobs.get(job_id) or {}
-        j.update(fields)
-        j["updated_at"] = time.time()
-        _jobs[job_id] = j
-        return dict(j)
-
-
-def job_get(job_id):
-    with _job_lock:
-        j = _jobs.get(job_id)
-        return dict(j) if j else None
-
-
-def start_job(name, target, *args, job_id=None, **kwargs):
-    """Run work in a non-daemon thread so it keeps going after Mini App closes.
-    Returns job_id. target may accept progress via kwargs if designed for it.
-    """
-    jid = job_id or _new_job_id()
-    job_set(
-        jid,
-        id=jid,
-        name=name,
-        status="running",
-        percent=0,
-        message="Starting…",
-        result=None,
-        error=None,
-        created_at=time.time(),
-    )
-
-    def runner():
-        try:
-            target(*args, **kwargs)
-            cur = job_get(jid) or {}
-            if cur.get("status") == "running":
-                job_set(jid, status="done", percent=100, message=cur.get("message") or "Done")
-        except Exception as e:
-            print("job", name, "error", e)
-            job_set(jid, status="error", percent=100, message=str(e)[:200], error=str(e)[:200])
-
-    th = threading.Thread(target=runner, name="job-%s-%s" % (name, jid), daemon=False)
-    th.start()
-    return jid
-
-
-
-
-def _html(name):
-    path = ROOT / name
-    try:
-        if path.is_file():
-            return path.read_text(encoding="utf-8")
-    except Exception:
-        pass
-    if name == "login.html":
-        return base64.b64decode(_LOGIN_B64).decode("utf-8")
-    if name == "dashboard.html":
-        return base64.b64decode(_DASH_B64).decode("utf-8")
-    return "<h1>Not found</h1>"
-
-
-@flask_app.route("/")
-def root():
-    return redirect("/login")
-
-
-@flask_app.route("/login")
-def login_page():
-    return _html("login.html"), 200, {
-        "Content-Type": "text/html; charset=utf-8",
-        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-        "Pragma": "no-cache",
-    }
-
-
-@flask_app.route("/app")
-@flask_app.route("/dashboard")
-def app_page():
-    return _html("dashboard.html"), 200, {
-        "Content-Type": "text/html; charset=utf-8",
-        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-        "Pragma": "no-cache",
-    }
-
-
-@flask_app.route("/api/me", methods=["POST"])
-def api_me():
-    body = request.get_json(silent=True) or {}
-    tg_id, user = resolve_tg(body)
-    if not tg_id or not user:
-        return jsonify({"ok": False, "error": "Open from Telegram bot → Open App"}), 401
-    upsert_user(tg_id, user.get("username") or "", user.get("first_name") or "", user.get("last_name") or "", user.get("photo_url") or "")
-    st = sub_status(tg_id)
-    # Admin access is independent of the subscription database.
-    # This keeps the Mini App and bot permissions in sync even if the
-    # subscription row was written by another Railway process/container.
-    admin = is_admin(tg_id)
-    if admin:
-        st = {
-            "active": True,
-            "plan": "lifetime",
-            "plan_label": "Lifetime",
-            "remaining": "Lifetime",
-            "expires_str": "Admin",
-        }
-    row = get_user(tg_id) or {}
-    member_since = "—"
-    try:
-        if row.get("joined_at"):
-            member_since = datetime.utcfromtimestamp(float(row["joined_at"])).strftime("%b %d, %Y")
-    except Exception:
-        pass
-    resp = jsonify({
-        "ok": True,
-        "user": {
-            "id": tg_id,
-            "username": user.get("username") or "",
-            "first_name": user.get("first_name") or "",
-            "last_name": user.get("last_name") or "",
-            "photo_url": user.get("photo_url") or "",
-        },
-        "subscription": st,
-        "member_since": member_since,
-        "is_admin": admin,
-    })
-    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    resp.headers["Pragma"] = "no-cache"
-    return resp
-
-
-@flask_app.route("/api/plans")
-def api_plans():
-    plans = []
-    for k, v in PLANS.items():
-        plans.append({
-            "key": k,
-            "label": v["label"],
-            "days": v["days"],
-            "stars": v.get("stars", 0),
-            "money": v.get("money", 0),
-            "money_label": v.get("money_label", ""),
-        })
-    pay = {
-        
-        "paypal": PAY_PAYPAL,
-        
-    }
-    return jsonify({"ok": True, "plans": plans, "payment": pay})
-
-
-@flask_app.route("/api/buy_stars", methods=["POST"])
-def api_buy_stars():
-    """Create Stars invoice link for Mini App (Telegram.WebApp.openInvoice)."""
-    body = request.get_json(silent=True) or {}
-    tg_id, _ = resolve_tg(body)
-    if not tg_id:
-        return jsonify({"ok": False, "error": "telegram_required"}), 401
-    key = (body.get("plan") or "").strip().lower()
-    plan = PLANS.get(key)
-    if not plan:
-        return jsonify({"ok": False, "error": "invalid_plan"})
-    if not bot:
-        return jsonify({"ok": False, "error": "bot_offline"})
-    stars = int(plan.get("stars") or 0)
-    if stars < 1:
-        return jsonify({"ok": False, "error": "stars_price_not_set"})
-    title = "DARK CPM — %s" % plan["label"]
-    description = "Subscription %s · %d Telegram Stars" % (plan["label"], stars)
-    payload = "stars:%s:%s" % (key, tg_id)
-    prices = [types.LabeledPrice(label=plan["label"], amount=stars)]
-    try:
-        # send invoice in chat; also return for openInvoice if link available
-        bot.send_invoice(
-            chat_id=int(tg_id),
-            title=title,
-            description=description,
-            invoice_payload=payload,
-            provider_token="",  # empty = Telegram Stars
-            currency="XTR",
-            prices=prices,
-        )
-        return jsonify({
-            "ok": True,
-            "message": "Invoice sent in bot chat — open bot and pay with Stars",
-            "plan": key,
-            "stars": stars,
-        })
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)[:160]})
-
-
-@flask_app.route("/api/buy_money", methods=["POST"])
-def api_buy_money():
-    """Register a money-payment request; admin confirms with /givesub."""
-    body = request.get_json(silent=True) or {}
-    tg_id, user = resolve_tg(body)
-    if not tg_id:
-        return jsonify({"ok": False, "error": "telegram_required"}), 401
-    key = (body.get("plan") or "").strip().lower()
-    plan = PLANS.get(key)
-    if not plan:
-        return jsonify({"ok": False, "error": "invalid_plan"})
-    note = (body.get("note") or "").strip()[:200]
-    username = (user or {}).get("username") or body.get("username") or ""
-    # notify admins
-    lines = [
-        "💰 <b>Money payment request</b>",
-        "User: <code>%s</code> @%s" % (tg_id, username or "—"),
-        "Plan: <b>%s</b> · %s" % (plan["label"], plan.get("money_label") or ("$%s" % plan.get("money"))),
-        "Note: %s" % (note or "—"),
-        "",
-        "Activate: <code>/givesub %s %s</code>" % (tg_id, key),
-    ]
-    for aid in ADMIN_IDS:
-        try:
-            bot.send_message(aid, "\n".join(lines))
-        except Exception:
-            pass
-    try:
-        bot.send_message(
-            int(tg_id),
-            "📩 Payment request sent to admin.\nPlan: <b>%s</b> · %s\n\n%s"
-            % (plan["label"], plan.get("money_label"), _money_instructions()),
-        )
-    except Exception:
-        pass
-    return jsonify({
-        "ok": True,
-        "message": "Request sent to admin. Pay then wait for activation.",
-        "plan": key,
-        "money_label": plan.get("money_label"),
-        "instructions": _money_instructions_plain(),
-    })
-
-
-
-@flask_app.route("/api/cpm_login", methods=["POST"])
-def api_cpm_login():
-    body = request.get_json(silent=True) or {}
-    tg_id, _ = resolve_tg(body)
-    if not tg_id:
-        return jsonify({"ok": False, "error": "Open from Telegram bot → Open App"}), 401
-    email = (body.get("email") or "").strip()
-    password = body.get("password") or ""
-    try:
-        lr = nuker.login(email, password)
-        if not lr.get("ok"):
-            return jsonify({"ok": False, "error": lr.get("message", "login_failed")})
-        uid_key = int(hashlib.sha256(
-    ("web_%s" % tg_id).encode("utf-8")
-).hexdigest()[:12], 16) % (10**9)
-        nuker.save_token(uid_key, lr["auth"], email, password, lr.get("refresh_token", ""), lr.get("firebase_uid", ""))
-        _cpm_sessions[tg_id] = {"email": email, "password": password, "auth": lr["auth"], "fuid": lr.get("firebase_uid", ""), "uid_key": uid_key}
-        return jsonify({"ok": True, "email": email})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)[:120]})
-
-
-@flask_app.route("/api/cpm_register", methods=["POST"])
-def api_cpm_register():
-    body = request.get_json(silent=True) or {}
-    tg_id, _ = resolve_tg(body)
-    if not tg_id:
-        return jsonify({"ok": False, "error": "Open from Telegram bot → Open App"}), 401
-    email = (body.get("email") or "").strip()
-    password = body.get("password") or ""
-    if not email or "@" not in email:
-        return jsonify({"ok": False, "error": "Enter a valid email"})
-    if len(password) < 6:
-        return jsonify({"ok": False, "error": "Password min 6 chars"})
-    try:
-        lr = nuker.register(email, password)
-        if not lr.get("ok"):
-            return jsonify({"ok": False, "error": lr.get("message", "register_failed")})
-        lr2 = nuker.login(email, password)
-        if lr2.get("ok"):
-            lr = lr2
-        uid_key = int(hashlib.sha256(
-    ("web_%s" % tg_id).encode("utf-8")
-).hexdigest()[:12], 16) % (10**9)
-        nuker.save_token(uid_key, lr["auth"], email, password, lr.get("refresh_token", ""), lr.get("firebase_uid", ""))
-        _cpm_sessions[tg_id] = {"email": email, "password": password, "auth": lr["auth"], "fuid": lr.get("firebase_uid", ""), "uid_key": uid_key}
-        return jsonify({"ok": True, "email": email, "message": "Account created"})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)[:120]})
-
-
-
-@flask_app.route("/api/cpm_logout", methods=["POST"])
-def api_cpm_logout():
-    body = request.get_json(silent=True) or {}
-    tg_id, _ = resolve_tg(body)
-    if tg_id and tg_id in _cpm_sessions:
-        _cpm_sessions.pop(tg_id, None)
-    return jsonify({"ok": True})
-
-
-@flask_app.route("/api/cpm_session")
-def api_cpm_session():
-    tg_id = request.args.get("tg_id", type=int)
-    if not tg_id or tg_id not in _cpm_sessions:
-        return jsonify({"ok": False})
-    sess = _cpm_sessions[tg_id]
-    profile = None
-    try:
-        uid_key = sess.get("uid_key") or abs(hash("web_%s" % tg_id)) % (10**9)
-        nuker.save_token(uid_key, sess["auth"], sess["email"], sess["password"], "", sess.get("fuid", ""))
-        nuker.load(uid_key, force=True)
-        info = nuker.get_account_info(uid_key)
-        if isinstance(info, dict) and info.get("ok"):
-            profile = {
-                "name": info.get("name"),
-                "money": info.get("money"),
-                "coin": info.get("coin"),
-                "player_id": info.get("localID"),
-                "localID": info.get("localID"),
-            }
-    except Exception:
-        pass
-    return jsonify({"ok": True, "email": sess["email"], "profile": profile})
-
-
-def _sess(tg_id):
-    sess = _cpm_sessions.get(tg_id)
-    if sess:
-        return sess
-
-    try:
-        uid_key = int(hashlib.sha256(
-            ("web_%s" % tg_id).encode("utf-8")
-        ).hexdigest()[:12], 16) % (10**9)
-
-        td = nuker.get_token_data(uid_key)
-        if not td:
-            return None
-
-        ok, _, auth = nuker.get_auth(uid_key)
-        if not ok or not auth:
-            return None
-
-        sess = {
-            "email": td.get("email", ""),
-            "password": td.get("password", ""),
-            "auth": auth,
-            "fuid": td.get("firebase_uid", ""),
-            "uid_key": uid_key,
-        }
-
-        _cpm_sessions[tg_id] = sess
-        return sess
-
-    except Exception:
-        return None
-
-
-@flask_app.route("/api/action", methods=["POST"])
-def api_action():
-    body = request.get_json(silent=True) or {}
-    tg_id, _ = resolve_tg(body)
-    if not tg_id:
-        return jsonify({"ok": False, "error": "telegram_required"}), 401
-    if not require_sub(tg_id):
-        return jsonify({"ok": False, "error": "subscription_required"}), 403
-    sess = _sess(tg_id)
-    if not sess:
-        return jsonify({"ok": False, "error": "login_required"})
-    action = body.get("action") or ""
-    value = body.get("value")
-    try:
-        uid = sess.get("uid_key") or int(hashlib.sha256(
-    ("web_%s" % tg_id).encode("utf-8")
-).hexdigest()[:12], 16) % (10**9)
-        nuker.save_token(uid, sess["auth"], sess["email"], sess["password"], "", sess.get("fuid", ""))
-
-        mapping = {
-            "acc_rank": lambda: nuker.set_rank(uid),
-            "acc_refresh": lambda: nuker.get_account_info(uid, force_refresh=True),
-            "eco_money": lambda: nuker.set_money(uid, 50_000_000),
-            "eco_coin": lambda: nuker.set_coin(uid, 500_000),
-            "eco_money_c": lambda: nuker.set_money(uid, int(float(value or 0))),
-            "eco_coin_c": lambda: nuker.set_coin(uid, int(float(value or 0))),
-            "unl_w16": lambda: nuker.unlock_w16(uid),
-            "unl_smoke": lambda: nuker.unlock_smoke(uid),
-            "unl_fuel": lambda: nuker.unlimited_fuel(uid),
-            "unl_damage": lambda: nuker.disable_damage(uid),
-            "unl_horns": lambda: nuker.unlock_horns(uid),
-            "unl_anim": lambda: nuker.unlock_animations(uid),
-            "unl_houses": lambda: nuker.unlock_houses(uid),
-            "unl_wheels": lambda: nuker.unlock_wheels(uid),
-            "unl_levels": lambda: nuker.complete_all_levels(uid),
-            "unl_clothes": lambda: nuker.unlock_all_clothes(uid),
-            "unl_all": lambda: nuker.unlock_all_features(uid),
-            "acc_name": lambda: nuker.change_player_name(uid, str(value or "")),
-            "acc_id": lambda: nuker.change_player_id(uid, str(value or "")),
-        }
-        if action == "acc_email":
-            return jsonify({"ok": True, "message": "Email change: use game settings / admin tools"})
-        if action == "acc_pass":
-            return jsonify({"ok": True, "message": "Password change requested (handle via Firebase if configured)"})
-        if action == "veh_siren":
-            email, password = sess["email"], sess["password"]
-            def work_siren():
-                res = unlock_siren(email, password, car_id=None)
-                _send_tg(tg_id, "%s Siren all: %s" % ("✅" if res.get("ok") else "❌", res.get("message", "")))
-            start_job("siren_all", work_siren)
-            return jsonify({"ok": True, "message": "Siren job started — close app OK, result on Telegram"})
-        if action == "veh_siren_one":
-            email, password = sess["email"], sess["password"]
-            cid = int(value) if value is not None else None
-            def work_siren1():
-                res = unlock_siren(email, password, car_id=cid)
-                _send_tg(tg_id, "%s Siren one: %s" % ("✅" if res.get("ok") else "❌", res.get("message", "")))
-            start_job("siren_one", work_siren1)
-            return jsonify({"ok": True, "message": "Siren job started — close app OK, result on Telegram"})
-        if action == "plate_inject":
-            email, password = sess["email"], sess["password"]
-            def work_plates():
-                res = inject_plates(email, password, merge=True)
-                _send_tg(tg_id, "%s Plates: %s" % ("✅" if res.get("ok") else "❌", res.get("message", "")))
-            start_job("plates", work_plates)
-            return jsonify({"ok": True, "message": "Plate inject started — close app OK, result on Telegram"})
-        if action == "veh_all":
-            email, password = sess["email"], sess["password"]
-            def work_all():
-                res = unlock_all_cars(email, password)
-                _send_tg(tg_id, "%s Unlock all cars: %s" % ("✅" if res.get("ok") else "❌", res.get("message", "")))
-            start_job("veh_all", work_all)
-            return jsonify({"ok": True, "message": "Unlock all cars started — result on Telegram"})
-        if action == "veh_one":
-            email, password = sess["email"], sess["password"]
-            if value is None or str(value).strip() == "":
-                return jsonify({"ok": False, "error": "Car ID required"})
-            try:
-                cid = int(value)
-            except Exception:
-                return jsonify({"ok": False, "error": "Invalid car ID"})
-            def work_one():
-                res = unlock_one_car(email, password, cid)
-                _send_tg(tg_id, "%s Unlock car %s: %s" % ("✅" if res.get("ok") else "❌", cid, res.get("message", "")))
-            start_job("veh_one", work_one)
-            return jsonify({"ok": True, "message": "Unlock car %s started — result on Telegram" % cid})
-        if action == "veh_w124":
-            email, password = sess["email"], sess["password"]
-            def work_w124():
-                # common W124 id attempts
-                last = None
-                for cid in (106, 61, 107, 108):
-                    last = unlock_one_car(email, password, cid)
-                    if last.get("ok"):
-                        break
-                res = last or {"ok": False, "message": "W124 not on source"}
-                _send_tg(tg_id, "%s W124: %s" % ("✅" if res.get("ok") else "❌", res.get("message", "")))
-            start_job("veh_w124", work_w124)
-            return jsonify({"ok": True, "message": "W124 unlock started — result on Telegram"})
-        if action == "veh_camry":
-            email, password = sess["email"], sess["password"]
-            def work_camry():
-                last = None
-                for cid in (120, 121, 122):
-                    last = unlock_one_car(email, password, cid)
-                    if last.get("ok"):
-                        break
-                res = last or {"ok": False, "message": "Camry not on source"}
-                _send_tg(tg_id, "%s Camry: %s" % ("✅" if res.get("ok") else "❌", res.get("message", "")))
-            start_job("veh_camry", work_camry)
-            return jsonify({"ok": True, "message": "Camry unlock started — result on Telegram"})
-        fn = mapping.get(action)
-        if not fn:
-            return jsonify({"ok": False, "error": "unknown_action"})
-        res = fn()
-        ok = bool(res.get("ok")) if isinstance(res, dict) else True
-        msg = (res.get("message") if isinstance(res, dict) else None) or ("OK" if ok else "Failed")
-        return jsonify({"ok": ok, "message": msg})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)[:150]})
-
-
-def _send_tg(tg_id, text):
-    if not bot:
+    result = nuker._modify(uid, {"platesData": final}, force_fields={"platesData"})
+    if not result.get("ok"):
+        return {"ok": False, "message": "Could not save plates: " + str(result.get("message", "unknown error"))}
+    return {"ok": True, "message": "Plates injected: %d" % len(final.get("allPlates") or [])}
+
+
+# ══════════ ILIJA COMBINED BOT UI ══════════
+SESSIONS = {}
+def S(uid): return SESSIONS.setdefault(uid, {})
+
+def _cpm1_uid(uid, email):
+    return int(hashlib.sha256((str(uid) + ':' + email.lower()).encode('utf-8')).hexdigest()[:12], 16) % (10**9)
+
+def kb_game():
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.add(types.InlineKeyboardButton("🚘 CPM1", callback_data="g_cpm1"),
+          types.InlineKeyboardButton("🚔 CPM2", callback_data="g_cpm2"))
+    m.add(types.InlineKeyboardButton("🆕 Create CPM2 account", callback_data="create_c2"))
+    return m
+
+def kb_menu(game):
+    m = types.InlineKeyboardMarkup(row_width=2)
+    if game == "cpm1":
+        rows = [
+            ("👑 KING RANK", "rank"), ("📊 Account info", "info"),
+            ("💰 Max money", "money_max"), ("🪙 Max coins", "coin_max"),
+            ("💵 Set money", "money_custom"), ("🪙 Set coins", "coin_custom"),
+            ("⚡ Unlock W16", "w16"), ("💨 Unlock smoke", "smoke"),
+            ("📯 Unlock horns", "horns"), ("⛽ Unlimited fuel", "fuel"),
+            ("🛡️ No engine damage", "damage"), ("🎭 Animations", "animations"),
+            ("🏠 Unlock houses", "houses"), ("🛞 Unlock wheels", "wheels"),
+            ("🏁 Complete levels", "levels"), ("👕 All clothes", "clothes"),
+            ("🔓 Unlock feature pack", "unlock_all"), ("🛠️ Fix account", "fix"),
+            ("✏️ Change name", "name"), ("🆔 Custom ID", "id"),
+            ("🚗 Unlock all cars", "cars_all"), ("🚘 Unlock one car", "car_one"),
+            ("🚨 Siren all cars", "siren_all"), ("🚨 Siren one car", "siren_one"),
+            ("🔢 Inject plates.json", "plates"), ("📋 Clone from source", "clone"),
+            ("📦 Bulk clone (max 50)", "bulk_clone"),
+            ("📧 Change email", "email"), ("🔐 Change password", "pass"),
+        ]
+    else:
+        rows = [
+            ("👑 KING RANK", "rank"), ("🏆 MAX WIN RACE", "race"),
+            ("💰 Set money", "money_custom"), ("🔓 Unlock everything", "unlock"),
+            ("✏️ Change name", "name"), ("🎁 Daily reward", "daily"),
+            ("📧 Change email", "email"), ("🔐 Change password", "pass"),
+        ]
+    for label, act in rows:
+        m.add(types.InlineKeyboardButton(label, callback_data="act_" + act))
+    m.add(types.InlineKeyboardButton("🔄 Switch game", callback_data="switch"))
+    return m
+
+@bot.message_handler(commands=['start'])
+def cmd_start(m):
+    SESSIONS.pop(m.from_user.id, None)
+    bot.send_message(m.chat.id,
+        "⚡ <b>ILIJA CPM TOOLS</b> ⚡\n━━━━━━━━━━━━━━\nCPM1 + CPM2 tools\n\nChoose your game:",
+        reply_markup=kb_game(), parse_mode="HTML")
+
+@bot.callback_query_handler(func=lambda c: c.data in ("g_cpm1", "g_cpm2", "switch"))
+def cb_game(c):
+    uid=c.from_user.id
+    if c.data == "g_cpm1": game="cpm1"
+    elif c.data == "g_cpm2": game="cpm2"
+    else: game="cpm2" if S(uid).get("game") == "cpm1" else "cpm1"
+    S(uid)["game"]=game
+    S(uid)["state"]="email"
+    bot.answer_callback_query(c.id)
+    bot.edit_message_text(f"🎮 <b>{game.upper()}</b> selected.\n\nSend your account EMAIL:", c.message.chat.id, c.message.message_id, parse_mode="HTML")
+
+@bot.callback_query_handler(func=lambda c: c.data == "create_c2")
+def cb_create_c2(c):
+    bot.answer_callback_query(c.id)
+    if c.from_user.id != OWNER_ID:
+        bot.send_message(c.message.chat.id, "❌ Account creation is owner-only.")
         return
-    try:
-        text = str(text)
-        while text:
-            bot.send_message(int(tg_id), text[:3500], parse_mode="HTML")
-            text = text[3500:]
-    except Exception as e:
-        print("send_tg", e)
+    S(c.from_user.id)["state"]="create_count"
+    bot.send_message(c.message.chat.id, "How many CPM2 accounts? Enter 1–50.")
 
-
-
-@flask_app.route("/api/job/<job_id>")
-def api_job_status(job_id):
-    j = job_get(job_id)
-    if not j:
-        return jsonify({"ok": False, "error": "job_not_found"}), 404
-    return jsonify({
-        "ok": True,
-        "id": j.get("id"),
-        "name": j.get("name"),
-        "status": j.get("status"),
-        "percent": int(j.get("percent") or 0),
-        "message": j.get("message") or "",
-        "error": j.get("error"),
-        "result": j.get("result"),
-    })
-
-
-@flask_app.route("/api/clone", methods=["POST"])
-def api_clone():
-    body = request.get_json(silent=True) or {}
-    tg_id, _ = resolve_tg(body)
-    if not tg_id:
-        return jsonify({"ok": False, "error": "telegram_required"}), 401
-    if not require_sub(tg_id):
-        return jsonify({"ok": False, "error": "subscription_required"}), 403
-    src_email, src_pass = (body.get("src_email") or "").strip(), body.get("src_pass") or ""
-    tgt_email, tgt_pass = (body.get("tgt_email") or "").strip(), body.get("tgt_pass") or ""
-    if not all([src_email, src_pass, tgt_email, tgt_pass]):
-        return jsonify({"ok": False, "error": "need source and target email:pass"})
-
-    jid = _new_job_id()
-
+@bot.message_handler(func=lambda m: S(m.from_user.id).get("state") == "create_count")
+def on_create_count(m):
+    st=S(m.from_user.id); st["state"]=None
+    if m.from_user.id != OWNER_ID:
+        bot.reply_to(m, "Access denied."); return
+    try: count=int((m.text or "").strip())
+    except ValueError: bot.reply_to(m, "Enter a whole number from 1 to 50."); return
+    if not 1 <= count <= 50:
+        bot.reply_to(m, "Enter a number from 1 to 50."); return
+    status=bot.send_message(m.chat.id, f"⏳ Creating {count} CPM2 account(s)…")
     def work():
-        def on_progress(pct, msg):
-            job_set(jid, percent=int(pct), message=str(msg), status="running")
-
-        try:
-            res = web_clone_account(src_email, src_pass, tgt_email, tgt_pass, progress_cb=on_progress)
-            job_set(
-                jid,
-                status="done" if res.get("ok") else "error",
-                percent=100,
-                message=res.get("message", "Done"),
-                result=res,
-            )
-            _send_tg(tg_id, "%s <b>Clone finished</b>\n<code>%s</code> → <code>%s:%s</code>\n%s" % (
-                "✅" if res.get("ok") else "❌", src_email, tgt_email, tgt_pass, res.get("message", "")))
-        except Exception as e:
-            job_set(jid, status="error", percent=100, message=str(e)[:200], error=str(e)[:200])
-            _send_tg(tg_id, "❌ Clone error: %s" % str(e)[:200])
-
-    start_job("clone", work, job_id=jid)
-    _send_tg(tg_id, "⏳ Clone started on server.\nYou can close the Mini App — result will still be sent here.")
-    return jsonify({"ok": True, "job_id": jid, "message": "Clone started"})
-
-
-
-@flask_app.route("/api/bulk_clone", methods=["POST"])
-def api_bulk_clone():
-    body = request.get_json(silent=True) or {}
-    tg_id, _ = resolve_tg(body)
-    if not tg_id:
-        return jsonify({"ok": False, "error": "telegram_required"}), 401
-    if not require_sub(tg_id):
-        return jsonify({"ok": False, "error": "subscription_required"}), 403
-    src_email, src_pass = (body.get("src_email") or "").strip(), body.get("src_pass") or ""
-    try:
-        count = int(body.get("count") or 1)
-    except Exception:
-        count = 1
-    count = max(1, min(50 if not is_admin(tg_id) else 100, count))
-    if not src_email or not src_pass:
-        return jsonify({"ok": False, "error": "need source email:pass"})
-
-    jid = _new_job_id()
-
-    def work():
-        def on_progress(i, total, msg, pct=None):
-            if pct is None:
-                pct = int(100 * int(i) / max(1, int(total)))
-            job_set(jid, percent=int(pct), message=str(msg), status="running")
-
-        try:
-            res = web_bulk_clone(src_email, src_pass, count, progress_cb=on_progress)
-            accounts = res.get("accounts") or []
-            job_set(jid, status="done" if res.get("ok") else "error", percent=100,
-                    message=res.get("message", "Done"), result={"count": len(accounts)})
-            lines = ["DARK CPM bulk clone", "Source: " + src_email, "Count: %d" % len(accounts), "NOT copied: friends", ""] + accounts
-            bio = io.BytesIO("\n".join(lines).encode("utf-8"))
-            bio.name = "bulk_clone_%d.txt" % len(accounts)
+        made=[]; failed=0
+        for _ in range(count):
+            email=gen_email(); password=gen_password()
             try:
-                bot.send_document(int(tg_id), bio, caption="Bulk clone done · %d accounts" % len(accounts))
-            except Exception as e:
-                _send_tg(tg_id, "%s\n%s" % (res.get("message", "Done"), "\n".join(accounts[:20])))
-                print("bulk send", e)
-        except Exception as e:
-            job_set(jid, status="error", percent=100, message=str(e)[:200], error=str(e)[:200])
-            _send_tg(tg_id, "❌ Bulk clone error: %s" % str(e)[:200])
-
-    start_job("bulk_clone", work, job_id=jid)
-    _send_tg(tg_id, "⏳ Bulk clone (%d) running on server.\nYou can close the Mini App — file will still be sent here when done." % count)
-    return jsonify({"ok": True, "job_id": jid, "message": "Bulk clone started", "count": count})
-
-
-
-# ---------- Bot launcher (inline keyboards) ----------
-def start_text(user):
-    st = sub_status(user.id)
-    sub = ("✅ %s · %s" % (st.get("plan_label"), st.get("remaining"))) if st.get("active") else "❌ No subscription"
-    return (
-        "<b>DARK CPM</b>\n"
-        "━━━━━━━━━━━━━━━━\n"
-        "👤 %s\n"
-        "🆔 <code>%s</code>\n"
-        "📱 @%s\n"
-        "━━━━━━━━━━━━━━━━\n"
-        "📦 %s\n"
-        "━━━━━━━━━━━━━━━━\n"
-        "Features run in the <b>Mini App</b>.\n"
-        "Login OK without plan — menu unlocks after subscription."
-    ) % (user.first_name or "User", user.id, user.username or "—", sub)
-
-
-def webapp_kb():
-    """Main /start inline keyboard."""
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    url = (WEBAPP_URL or "").rstrip("/") + "/login"
-    if url.startswith("http"):
-        kb.add(types.InlineKeyboardButton("🚀 Open App", web_app=types.WebAppInfo(url=url)))
-    kb.row(
-        types.InlineKeyboardButton("💳 Buy Subscription", callback_data="buy_sub"),
-        types.InlineKeyboardButton("📊 My Status", callback_data="my_status"),
-    )
-    return kb
-
-
-def plans_kb():
-    """Plan list with Stars + money prices."""
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    for k, p in PLANS.items():
-        label = "%s · %d★ · %s" % (p["label"], p.get("stars", 0), p.get("money_label", ""))
-        kb.add(types.InlineKeyboardButton(label, callback_data="plan_" + k))
-    kb.add(types.InlineKeyboardButton("« Back", callback_data="back_start"))
-    return kb
-
-
-def plan_pay_kb(plan_key):
-    p = PLANS.get(plan_key) or {}
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("⭐ Pay %d Stars" % p.get("stars", 0), callback_data="stars_" + plan_key))
-    kb.add(types.InlineKeyboardButton("💵 Pay money %s" % p.get("money_label", ""), callback_data="money_" + plan_key))
-    kb.add(types.InlineKeyboardButton("« Plans", callback_data="buy_sub"))
-    return kb
-
-
-if bot:
-    @bot.message_handler(commands=["start", "Start", "menu"])
-    def cmd_start(message):
-        try:
-            u = message.from_user
-            upsert_user(u.id, u.username or "", u.first_name or "", u.last_name or "")
-            bot.send_message(message.chat.id, start_text(u), reply_markup=webapp_kb())
-        except Exception as e:
-            bot.reply_to(message, "DARK CPM · error: %s" % str(e)[:100])
-
-    @bot.callback_query_handler(func=lambda c: c.data == "my_status")
-    def cb_status(call):
-        st = sub_status(call.from_user.id)
-        if st.get("active"):
-            msg = "✅ %s · %s" % (st.get("plan_label"), st.get("remaining"))
-        else:
-            msg = "❌ No active subscription"
-        bot.answer_callback_query(call.id, msg, show_alert=True)
-
-    @bot.callback_query_handler(func=lambda c: c.data == "buy_sub")
-    def cb_buy_sub(call):
-        bot.answer_callback_query(call.id)
-        try:
-            bot.edit_message_text(
-                "<b>💳 Buy subscription</b>\n\n"
-                "⭐ Stars = instant unlock\n"
-                "💵 Money = pay then admin activates\n\n"
-                "GCash: <code>%s</code>\n"
-                "PayPal: <code>%s</code>"
-                % (PAY_GCASH or "—", PAY_PAYPAL or "—"),
-                call.message.chat.id,
-                call.message.message_id,
-                reply_markup=plans_kb(),
-                parse_mode="HTML",
-            )
-        except Exception as e:
-            bot.send_message(call.message.chat.id, "Plans", reply_markup=plans_kb())
-
-    @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("plan_"))
-    def cb_plan(call):
-        key = call.data.replace("plan_", "", 1)
-        plan = PLANS.get(key)
-        bot.answer_callback_query(call.id)
-        if not plan:
-            return
-        text = (
-            "<b>%s</b>\n\n"
-            "⭐ Stars: <b>%d</b>\n"
-            "💵 Money: <b>%s</b>\n\n"
-            "Choose payment method:"
-        ) % (plan["label"], plan.get("stars", 0), plan.get("money_label", ""))
-        try:
-            bot.edit_message_text(
-                text,
-                call.message.chat.id,
-                call.message.message_id,
-                reply_markup=plan_pay_kb(key),
-                parse_mode="HTML",
-            )
-        except Exception:
-            bot.send_message(call.message.chat.id, text, reply_markup=plan_pay_kb(key), parse_mode="HTML")
-
-    @bot.callback_query_handler(func=lambda c: c.data == "back_start")
-    def cb_back_start(call):
-        bot.answer_callback_query(call.id)
-        try:
-            bot.edit_message_text(
-                start_text(call.from_user),
-                call.message.chat.id,
-                call.message.message_id,
-                reply_markup=webapp_kb(),
-                parse_mode="HTML",
-            )
-        except Exception:
-            bot.send_message(call.message.chat.id, start_text(call.from_user), reply_markup=webapp_kb())
-
-    @bot.message_handler(commands=["givesub"])
-    def cmd_givesub(message):
-        if not is_admin(message.from_user.id):
-            return
-        parts = (message.text or "").split()
-        if len(parts) < 3:
-            bot.reply_to(message, "Usage: /givesub <tg_id> <1day|7days|1month|lifetime>")
-            return
-        try:
-            tid = int(parts[1])
-        except Exception:
-            bot.reply_to(message, "Invalid id")
-            return
-        plan = parts[2].lower()
-        if plan not in PLANS:
-            bot.reply_to(message, "Invalid plan")
-            return
-        upsert_user(tid)
-        if not set_subscription(tid, plan):
-            bot.reply_to(message, "❌ Subscription could not be saved. Try again.")
-            return
-        st = sub_status(tid)
-        bot.reply_to(message, "✅ %s → <code>%s</code> until %s\n🔗 Mini App membership synced" % (PLANS[plan]["label"], tid, st.get("expires_str")))
-        try:
-            bot.send_message(tid, "✅ Subscription: <b>%s</b>" % PLANS[plan]["label"])
-        except Exception:
-            pass
-
-    @bot.message_handler(commands=["remsub"])
-    def cmd_remsub(message):
-        if not is_admin(message.from_user.id):
-            return
-        parts = (message.text or "").split()
-        if len(parts) < 2:
-            return
-        try:
-            tid = int(parts[1])
-        except Exception:
-            return
-        clear_subscription(tid)
-        bot.reply_to(message, "Removed <code>%s</code>" % tid)
-
-    @bot.message_handler(commands=["users", "list"])
-    def cmd_users(message):
-        if not is_admin(message.from_user.id):
-            bot.reply_to(message, "Admin only")
-            return
-        with db() as c:
-            rows = c.execute(
-                "SELECT tg_id, username, sub_plan, sub_expires FROM users ORDER BY last_seen DESC LIMIT 50"
-            ).fetchall()
-        now = time.time()
-        lines = []
-        for r in rows:
-            active = r["sub_expires"] and float(r["sub_expires"]) > now
-            lines.append(
-                "%s <code>%s</code> @%s %s"
-                % ("OK" if active else "NO", r["tg_id"], r["username"] or "—", r["sub_plan"] or "-")
-            )
-        bot.send_message(
-            message.chat.id,
-            "<b>Users</b> (%d)\n\n%s" % (len(lines), "\n".join(lines) or "None"),
-            parse_mode="HTML",
-        )
-
-    @bot.message_handler(commands=["admin"])
-    def cmd_admin(message):
-        if not is_admin(message.from_user.id):
-            return
-        bot.reply_to(message, "<b>Admin</b>\n/givesub id plan\n/remsub id\n/users")
-
-
-
-
-if bot:
-
-    @bot.pre_checkout_query_handler(func=lambda q: True)
-    def pre_checkout(query):
-        try:
-            bot.answer_pre_checkout_query(query.id, ok=True)
-        except Exception as e:
-            print("pre_checkout", e)
-
-    @bot.message_handler(content_types=["successful_payment"])
-    def on_successful_payment(message):
-        try:
-            sp = message.successful_payment
-            payload = (sp.invoice_payload or "")
-            parts = payload.split(":")
-            if len(parts) >= 3 and parts[0] == "stars":
-                plan_key = parts[1]
-                try:
-                    buyer = int(parts[2])
-                except Exception:
-                    buyer = message.from_user.id
-            else:
-                plan_key = payload
-                buyer = message.from_user.id
-            if plan_key not in PLANS:
-                bot.send_message(message.chat.id, "Payment received but plan unknown. Contact admin.")
-                return
-            set_subscription(buyer, plan_key)
-            st = sub_status(buyer)
-            bot.send_message(
-                message.chat.id,
-                "✅ <b>Payment OK</b>\nPlan: <b>%s</b>\nUntil: %s\nStars: %s"
-                % (PLANS[plan_key]["label"], st.get("expires_str"), sp.total_amount),
-            )
-            if buyer != message.from_user.id:
-                try:
-                    bot.send_message(buyer, "✅ Subscription activated: <b>%s</b>" % PLANS[plan_key]["label"])
-                except Exception:
-                    pass
-        except Exception as e:
-            print("successful_payment", e)
-
-    @bot.message_handler(commands=["buy", "subscribe"])
-    def cmd_buy(message):
-        text = (
-            "<b>Buy subscription</b>\n\n"
-            "Stars = instant unlock\n"
-            "Money = GCash / PayPal\n\n"
-            "GCash: <code>%s</code>\n"
-            "PayPal: <code>%s</code>"
-        ) % (PAY_GCASH or "—", PAY_PAYPAL or "—")
-        bot.reply_to(message, text, reply_markup=plans_kb())
-
-    @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("stars_"))
-    def cb_stars(call):
-        key = call.data.replace("stars_", "", 1)
-        plan = PLANS.get(key)
-        if not plan:
-            bot.answer_callback_query(call.id, "Invalid")
-            return
-        uid = call.from_user.id
-        stars = int(plan.get("stars") or 0)
-        try:
-            bot.send_invoice(
-                chat_id=uid,
-                title="DARK CPM — %s" % plan["label"],
-                description="Subscription %s" % plan["label"],
-                invoice_payload="stars:%s:%s" % (key, uid),
-                provider_token="",
-                currency="XTR",
-                prices=[types.LabeledPrice(label=plan["label"], amount=stars)],
-            )
-            bot.answer_callback_query(call.id, "Invoice sent")
-        except Exception as e:
-            bot.answer_callback_query(call.id, str(e)[:80], show_alert=True)
-
-    @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("money_"))
-    def cb_money(call):
-        key = call.data.replace("money_", "", 1)
-        plan = PLANS.get(key)
-        if not plan:
-            bot.answer_callback_query(call.id, "Invalid")
-            return
-        uid = call.from_user.id
-        un = call.from_user.username or ""
-        text = (
-            "Pay with money — <b>%s</b>\n"
-            "Price: <b>%s</b>\n\n"
-            "%s\n\n"
-            "After pay, send screenshot here.\n"
-            "Admin: <code>/givesub %s %s</code>"
-        ) % (plan["label"], plan.get("money_label"), _money_instructions(), uid, key)
-        bot.answer_callback_query(call.id)
-        bot.send_message(call.message.chat.id, text)
-        for aid in ADMIN_IDS:
-            try:
-                bot.send_message(
-                    aid,
-                    "Money interest\nUser <code>%s</code> @%s\nPlan %s (%s)\n<code>/givesub %s %s</code>"
-                    % (uid, un or "—", plan["label"], plan.get("money_label"), uid, key),
-                )
+                rr=http.post(C2_FB_SIGNUP, json={"email":email,"password":password,"returnSecureToken":True}, timeout=20, verify=False)
+                data=rr.json()
+                if not data.get("idToken"):
+                    failed += 1; time.sleep(1); continue
+                token=data["idToken"]; game_uid=data["localId"]
+                try: c2_start_session(token)
+                except Exception: pass
+                wallet_ok=c2_charge_wallet(token, game_uid, email, password)
+                rank=c2_king_rank(email,password)
+                made.append({"email":email,"password":password,"money":bool(wallet_ok),"rank":bool(rank.get("ok"))})
             except Exception:
-                pass
+                failed += 1
+            time.sleep(1)
+        if not made:
+            out="❌ No accounts created. Failed: %d" % failed
+        else:
+            out="✅ <b>CPM2 accounts created: %d</b>\nFailed: %d\n\n" % (len(made),failed)
+            out += "\n\n".join("📧 <code>%s</code>\n🔑 <code>%s</code>\nStatus: %s" % (a['email'],a['password'], 'Rank + wallet' if a['rank'] and a['money'] else ('Wallet' if a['money'] else 'Created')) for a in made)
+        try: bot.edit_message_text(out[:3900], m.chat.id, status.message_id, parse_mode="HTML")
+        except Exception: bot.send_message(m.chat.id, out[:3900], parse_mode="HTML")
+    threading.Thread(target=work, daemon=True).start()
 
+INPUT_STATES=("email","pass","new_email","new_pass","new_money","new_coin","new_name","new_id","car_id","siren_car_id","bulk_count")
+@bot.message_handler(func=lambda m: S(m.from_user.id).get("state") in INPUT_STATES)
+def on_input(m):
+    uid=m.from_user.id; st=S(uid); txt=(m.text or "").strip()
+    try: bot.delete_message(m.chat.id,m.message_id)
+    except Exception: pass
+    state=st.get("state")
+    if state=="email":
+        if "@" not in txt: bot.send_message(m.chat.id,"❌ Enter a valid email."); return
+        st["email"]=txt; st["state"]="pass"; bot.send_message(m.chat.id,"🔑 Send your PASSWORD:"); return
+    if state=="pass":
+        st["password"]=txt; st["state"]=None; game=st.get("game")
+        if game=="cpm1":
+            lr=nuker.login(st["email"],txt)
+            if lr.get("ok"):
+                st["cpm1_uid"]=_cpm1_uid(uid,st["email"])
+                nuker.save_token(st["cpm1_uid"],lr["auth"],st["email"],txt,lr.get("refresh_token",""),lr.get("firebase_uid",""))
+        else: lr=c2_login(st["email"],txt)
+        if not lr.get("ok"):
+            bot.send_message(m.chat.id,"❌ <b>LOGIN FAILED</b>\n%s\n\nUse /start to retry." % (lr.get("message","Unknown error")),parse_mode="HTML")
+            SESSIONS.pop(uid,None); return
+        bot.send_message(m.chat.id,"✅ <b>LOGGED IN — %s</b>\n📧 <code>%s</code>\n\nChoose an action:"%(game.upper(),st["email"]),reply_markup=kb_menu(game),parse_mode="HTML"); return
+    if state=="new_email": st["state"]=None; run_action(uid,m.chat.id,"email",txt); return
+    if state=="new_pass": st["state"]=None; run_action(uid,m.chat.id,"pass",txt); return
+    if state=="new_money": st["state"]=None; run_action(uid,m.chat.id,"money_custom",txt); return
+    if state=="new_coin": st["state"]=None; run_action(uid,m.chat.id,"coin_custom",txt); return
+    if state=="new_name": st["state"]=None; run_action(uid,m.chat.id,"name",txt); return
+    if state=="new_id": st["state"]=None; run_action(uid,m.chat.id,"id",txt); return
+    if state=="car_id": st["state"]=None; run_action(uid,m.chat.id,"car_one",txt); return
+    if state=="siren_car_id": st["state"]=None; run_action(uid,m.chat.id,"siren_one",txt); return
+    if state=="bulk_count": st["state"]=None; run_action(uid,m.chat.id,"bulk_clone",txt); return
 
+@bot.callback_query_handler(func=lambda c: c.data.startswith("act_"))
+def cb_act(c):
+    uid=c.from_user.id; st=S(uid); act=c.data.replace("act_","",1)
+    bot.answer_callback_query(c.id)
+    if not st.get("email") or not st.get("password"):
+        bot.send_message(c.message.chat.id,"Session expired — /start again."); return
+    asks={"email":("new_email","📧 Send NEW EMAIL:"),"pass":("new_pass","🔐 Send NEW PASSWORD (min 6 chars):"),
+          "money_custom":("new_money","💰 Send amount (CPM1 max 50,000,000; CPM2 max 999,999,999):"),"coin_custom":("new_coin","🪙 Send amount (max 500,000):"),
+          "name":("new_name","✏️ Send NEW NAME:"),"id":("new_id","🆔 Send NEW ID:"),
+          "car_one":("car_id","🚘 Send CAR ID (number):"),"siren_one":("siren_car_id","🚨 Send CAR ID for siren (number):"),"bulk_clone":("bulk_count","📦 How many clone accounts? Enter 1–50:")}
+    if act in asks:
+        st["state"]=asks[act][0]; bot.send_message(c.message.chat.id,asks[act][1]); return
+    run_action(uid,c.message.chat.id,act,None)
 
-def run_flask():
-    flask_app.run(host="0.0.0.0", port=PORT, threaded=True, use_reloader=False)
-
+def run_action(uid,chat_id,act,newval):
+    st=S(uid); game=st.get("game"); em=st.get("email",""); pw=st.get("password","")
+    msg=bot.send_message(chat_id,"⏳ <b>Working…</b>",parse_mode="HTML")
+    def work():
+        try:
+            if game=="cpm2":
+                if act=="rank": r=c2_king_rank(em,pw)
+                elif act=="race": r=c2_max_race(em,pw)
+                elif act=="money": r=c2_money(em,pw)
+                elif act=="money_custom": r=c2_set_money_amount(em,pw,newval)
+                elif act=="unlock": r=c2_full_unlock_pack(em,pw)
+                elif act=="name": r=c2_change_name(em,pw,newval)
+                elif act=="daily": r=c2_daily_reward(em,pw)
+                elif act=="email": r=c2_change_email(em,pw,newval)
+                elif act=="pass": r=c2_change_password(em,pw,newval)
+                else: r={"ok":False,"message":"Unknown CPM2 action"}
+            else:
+                kid=st.get("cpm1_uid") or _cpm1_uid(uid,em)
+                mapping={
+                    "rank":lambda:nuker.set_rank(kid), "info":lambda:nuker.get_account_info(kid,force_refresh=True),
+                    "money_max":lambda:nuker.set_money(kid,MAX_MONEY), "coin_max":lambda:nuker.set_coin(kid,MAX_COIN),
+                    "money_custom":lambda:nuker.set_money(kid,int(newval)), "coin_custom":lambda:nuker.set_coin(kid,int(newval)),
+                    "w16":lambda:nuker.unlock_w16(kid), "smoke":lambda:nuker.unlock_smoke(kid),
+                    "horns":lambda:nuker.unlock_horns(kid), "fuel":lambda:nuker.unlimited_fuel(kid),
+                    "damage":lambda:nuker.disable_damage(kid), "animations":lambda:nuker.unlock_animations(kid),
+                    "houses":lambda:nuker.unlock_houses(kid), "wheels":lambda:nuker.unlock_wheels(kid),
+                    "levels":lambda:nuker.complete_all_levels(kid), "clothes":lambda:nuker.unlock_all_clothes(kid),
+                    "unlock_all":lambda:nuker.unlock_all_features(kid), "fix":lambda:nuker.fix_account(kid),
+                    "name":lambda:nuker.change_player_name(kid,str(newval or "")[:24]),
+                    "id":lambda:nuker.change_player_id(kid,str(newval or "")),
+                    "cars_all":lambda:unlock_all_cars(em,pw), "car_one":lambda:unlock_one_car(em,pw,int(newval)),
+                    "siren_all":lambda:unlock_siren(em,pw), "siren_one":lambda:unlock_siren(em,pw,int(newval)),
+                    "plates":lambda:inject_plates(em,pw,merge=True),
+                    "clone":lambda:web_clone_account(SOURCE_ACCOUNT[0],SOURCE_ACCOUNT[1],em,pw),
+                    "bulk_clone":lambda:web_bulk_clone(SOURCE_ACCOUNT[0],SOURCE_ACCOUNT[1],int(newval)),
+                    "email":lambda:c1_change_email(em,pw,str(newval)), "pass":lambda:c1_change_password(em,pw,str(newval)),
+                }
+                if act in ("money_custom","coin_custom"):
+                    val=int(newval)
+                    lim=MAX_MONEY if act=="money_custom" else MAX_COIN
+                    if val<0 or val>lim: r={"ok":False,"message":f"Amount must be 0–{lim:,}"}
+                    else: r=mapping[act]()
+                elif act in ("cars_all","car_one","siren_all","siren_one","plates","clone","bulk_clone") and (not SOURCE_ACCOUNT[0] or not SOURCE_ACCOUNT[1]):
+                    r={"ok":False,"message":"Set CPM1_SOURCE_EMAIL and CPM1_SOURCE_PASSWORD environment variables first."}
+                else: r=mapping[act]() if act in mapping else {"ok":False,"message":"Unknown CPM1 action"}
+                if act=="info" and r.get("ok"):
+                    r={"ok":True,"message":"Name: %s | Money: %s | Coins: %s | ID: %s | Cars: %s"%(r.get("name"),r.get("money"),r.get("coin"),r.get("localID"),r.get("cars"))}
+                if act=="bulk_clone" and r.get("ok"):
+                    accs=r.get("accounts") or []
+                    try:
+                        with open(f"fantom_clone_accounts_{uid}.txt","w",encoding="utf-8") as f: f.write("\n".join(accs))
+                        with open(f"fantom_clone_accounts_{uid}.txt","rb") as f: bot.send_document(chat_id,f,caption=r.get("message","Clone accounts"))
+                    except Exception: pass
+                    r={"ok":True,"message":r.get("message","Done")+" (credentials sent as a file if Telegram upload succeeded)."}
+            if not isinstance(r,dict): r={"ok":bool(r),"message":str(r)}
+        except Exception as e: r={"ok":False,"message":str(e)[:180]}
+        icon="✅" if r.get("ok") else "❌"
+        out=f"{icon} <b>{r.get('message','Done')}</b>"
+        try: bot.edit_message_text(out[:3900],chat_id,msg.message_id,reply_markup=kb_menu(game),parse_mode="HTML")
+        except Exception: pass
+    threading.Thread(target=work,daemon=True).start()
 
 if __name__ == "__main__":
-    print("DARK CPM Mini App product")
-    print("WEBAPP_URL =", WEBAPP_URL)
-    print("ADMIN_IDS =", ADMIN_IDS)
-    if bot:
-        try:
-            bot.remove_webhook()
-            me = bot.get_me()
-            print("Bot OK @%s" % me.username)
+    print("⚡ ILIJA CPM TOOLS — combined CPM1 + CPM2 starting…")
+    if not BOT_TOKEN: raise SystemExit("Set BOT_TOKEN environment variable to your NEW BotFather token first")
+    while True:
+        try: bot.infinity_polling(timeout=60,long_polling_timeout=60,skip_pending=True)
         except Exception as e:
-            print("Bot token issue:", e)
-    threading.Thread(target=run_flask, daemon=True).start()
-    if bot:
-        while True:
-            try:
-                bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True, none_stop=True)
-            except Exception as e:
-                print("poll", e)
-                time.sleep(3)
-    else:
-        run_flask()
+            print("poll error:",e); time.sleep(3)
