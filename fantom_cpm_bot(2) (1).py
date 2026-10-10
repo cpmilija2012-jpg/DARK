@@ -34,8 +34,8 @@ def _load_brotli():
 from telebot import types
 
 # ══════════ CONFIG - STAVI SVOJ TOKEN ══════════
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8949249913:AAGIzStf5qHYJYXnZHoLDG4dye0_SuliS6s")
-OWNER_ID = int(os.environ.get("OWNER_ID", "8003371335") or 0)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8682873022:AAFxpLAfUFZSX6GMC7ZCmVjZb7d7CBhl0Ts")
+OWNER_ID = int(os.environ.get("OWNER_ID", "8884756222") or 0)
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=4)
 
